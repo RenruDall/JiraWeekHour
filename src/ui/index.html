@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'">
+<title>Jira Week Hours</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <div id="banner" class="banner" hidden></div>
+
+  <main class="layout" id="layout">
+    <section class="week">
+      <header class="week-head">
+        <h1>This week</h1>
+        <span id="range" class="muted"></span>
+        <span id="demo-badge" class="badge badge-demo" hidden>Demo data</span>
+      </header>
+      <div id="days" class="card days" aria-live="polite"></div>
+    </section>
+
+    <aside class="side">
+      <section class="card today" id="today" aria-live="polite"></section>
+      <section class="card" id="weekcard"></section>
+      <section class="card" id="cats"></section>
+    </aside>
+  </main>
+
+  <main class="problem" id="setup" hidden>
+    <form class="setup-box" id="setup-form" novalidate>
+      <img src="icon.png" alt="" width="56" height="56">
+      <h1>Connect your Jira</h1>
+      <p class="muted">Paste the address you use to open Jira in the browser. Jira Cloud and Jira Data Center both work.</p>
+      <label class="field setup-field">
+        <span>Jira address</span>
+        <input id="setup-url" type="text" inputmode="url" spellcheck="false" autocomplete="url" placeholder="https://your-company.atlassian.net" required>
+      </label>
+      <p id="setup-error" class="form-error" role="alert" hidden></p>
+      <button type="submit" class="btn btn-primary setup-btn" id="setup-connect">Connect and sign in</button>
+      <p class="muted small">A Jira sign-in window opens. Log in once as usual; the app remembers it.<br>Prefer a token? Connect, then choose it in Settings.</p>
+      <button type="button" class="link-btn" id="setup-demo">Try it with sample data first</button>
+    </form>
+  </main>
+
+  <main class="problem" id="problem" hidden>
+    <div class="problem-box">
+      <div class="problem-icon" aria-hidden="true">!</div>
+      <h1 id="problem-title">Jira not reachable</h1>
+      <p id="problem-text" class="muted"></p>
+      <div class="problem-actions">
+        <button id="problem-signin" class="btn btn-primary" type="button">Sign in to Jira</button>
+        <button id="problem-retry" class="btn" type="button">Try again</button>
+        <button id="problem-settings" class="btn" type="button">Settings</button>
+        <button id="problem-demo" class="btn" type="button">Try demo mode</button>
+      </div>
+    </div>
+  </main>
+
+  <footer class="status">
+    <span id="who"></span>
+    <span id="last"></span>
+    <span id="next" class="grow"></span>
+    <button id="open-settings" class="link-btn" type="button">Settings</button>
+  </footer>
+</div>
+
+<div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+<aside id="drawer" class="drawer" hidden aria-labelledby="settings-title" role="dialog" aria-modal="true">
+  <form id="settings-form" class="drawer-body" novalidate>
+    <div class="drawer-head">
+      <h2 id="settings-title">Settings</h2>
+      <button type="button" class="icon-btn" id="close-settings" aria-label="Close settings">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+
+    <label class="field">
+      <span>Jira address</span>
+      <input id="f-url" type="text" inputmode="url" spellcheck="false" placeholder="https://your-company.atlassian.net">
+    </label>
+
+    <fieldset class="field">
+      <legend>How to sign in</legend>
+      <label class="choice"><input type="radio" name="auth" value="browser"> <span><strong>Sign in with Jira window</strong><br><small class="muted">Log in once, like in your browser. Works with company single sign-on.</small></span></label>
+      <label class="choice"><input type="radio" name="auth" value="token"> <span><strong>API token</strong><br><small class="muted">Jira Cloud: API token + e-mail. Data Center: personal access token. Stored encrypted for your user.</small></span></label>
+    </fieldset>
+
+    <div id="token-field" class="token-fields">
+      <label class="field">
+        <span>E-mail <small class="muted">(Jira Cloud only)</small></span>
+        <input id="f-email" type="email" autocomplete="off" spellcheck="false" placeholder="you@company.com">
+      </label>
+      <label class="field">
+        <span>Token <small class="muted" id="token-state"></small></span>
+        <input id="f-token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste to set or replace">
+      </label>
+    </div>
+
+    <div class="field-row">
+      <label class="field">
+        <span>Daily target (hours)</span>
+        <input id="f-target" type="number" min="1" max="24" step="0.25" required>
+      </label>
+      <label class="field">
+        <span>Automatic updates</span>
+        <input id="f-times" type="text" spellcheck="false" placeholder="12:00, 16:00">
+      </label>
+    </div>
+
+    <label class="field">
+      <span>Group hours by</span>
+      <select id="f-category">
+        <option value="sprint">Sprint</option>
+        <option value="issuetype">Issue type</option>
+        <option value="project">Project</option>
+        <option value="components">Component</option>
+        <option value="labels">Labels</option>
+        <option value="__custom">Custom field&#8230;</option>
+      </select>
+    </label>
+    <label class="field" id="custom-field" hidden>
+      <span>Custom field ID</span>
+      <input id="f-custom" type="text" spellcheck="false" placeholder="customfield_12345">
+    </label>
+
+    <label class="check" id="autostart-row"><input id="f-autostart" type="checkbox"> Start with Windows</label>
+    <label class="check"><input id="f-demo" type="checkbox"> Demo mode (sample data, no Jira needed)</label>
+
+    <p id="settings-error" class="form-error" role="alert" hidden></p>
+
+    <div class="drawer-actions">
+      <button type="submit" class="btn btn-primary">Save</button>
+      <button type="button" class="btn" id="cancel-settings">Cancel</button>
+    </div>
+
+    <div class="danger-zone">
+      <button type="button" class="link-btn danger" id="disconnect">Disconnect Jira</button>
+      <small class="muted">Signs out, removes the saved token and lets you connect another Jira.</small>
+    </div>
+  </form>
+</aside>
+
+<script src="renderer.js"></script>
+</body>
+</html>
