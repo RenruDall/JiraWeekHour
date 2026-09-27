@@ -74,11 +74,11 @@ npm test         # tests against fake Jira Cloud and Data Center servers
 npm run make     # build the installer (on Windows)
 ```
 
-The installer ends up in `out/make/squirrel.windows/x64/JiraWeekHours-Setup.exe`, plus a portable zip in `out/make/zip/`.
+The installer ends up in `out/make/squirrel.windows/x64/JiraWeekHours-Setup.exe`.
 
 ### Automatic builds on GitHub
 
-`.github/workflows/build.yml` runs the tests and builds the installer on every push to `main`. The installer is attached to the workflow run as an artifact.
+`.github/workflows/build.yml` runs the tests and builds the installer on every push to `main`. `JiraWeekHours-Setup.exe` is attached to the workflow run under *Artifacts*.
 
 To publish a release with the installer attached:
 
@@ -97,7 +97,7 @@ src/autostart.js   "Start with Windows"
 src/preload.js     safe bridge between the window and the app
 src/ui/            window (HTML, CSS, JS) and icons
 test/              tests with fake Jira servers
-forge.config.js    Electron Forge: Setup.exe and zip
+forge.config.js    Electron Forge: Setup.exe
 ```
 
 ## License

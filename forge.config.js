@@ -1,5 +1,9 @@
 'use strict';
 const path = require('path');
+const fs = require('fs');
+
+// Electron ships 55 UI languages; the app only needs these (others fall back to English)
+const KEEP_LOCALES = ['en-US.pak', 'de.pak', 'it.pak'];
 
 module.exports = {
   packagerConfig: {
@@ -14,6 +18,16 @@ module.exports = {
       ProductName: 'Jira Week Hours',
     },
   },
+  hooks: {
+    // Runs after Electron is unpacked and before the installer is built
+    packageAfterExtract: async (_forgeConfig, buildPath) => {
+      const dir = path.join(buildPath, 'locales');
+      if (!fs.existsSync(dir)) return;
+      for (const file of fs.readdirSync(dir)) {
+        if (file.endsWith('.pak') && !KEEP_LOCALES.includes(file)) fs.rmSync(path.join(dir, file), { force: true });
+      }
+    },
+  },
   makers: [
     {
       // Windows installer: JiraWeekHours-Setup.exe, installs per user, no admin rights
@@ -23,11 +37,6 @@ module.exports = {
         setupExe: 'JiraWeekHours-Setup.exe',
         setupIcon: path.join(__dirname, 'src', 'ui', 'icon.ico'),
       },
-    },
-    {
-      // Portable zip: unzip and run JiraWeekHours.exe
-      name: '@electron-forge/maker-zip',
-      platforms: ['win32'],
     },
   ],
 };
