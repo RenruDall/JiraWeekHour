@@ -12,16 +12,46 @@
 
   <main class="layout" id="layout">
     <section class="week">
-      <header class="week-head">
-        <h1>This week</h1>
-        <span id="range" class="muted"></span>
+      <header class="toolbar">
+        <div class="tabs" role="tablist" aria-label="View">
+          <button type="button" role="tab" class="tab" id="tab-week" data-view="week" aria-selected="true">Week</button>
+          <button type="button" role="tab" class="tab" id="tab-calendar" data-view="calendar" aria-selected="false">Calendar</button>
+          <button type="button" role="tab" class="tab" id="tab-log" data-view="log" aria-selected="false">Log</button>
+          <button type="button" role="tab" class="tab" id="tab-team" data-view="team" aria-selected="false" hidden>Team</button>
+        </div>
         <span id="demo-badge" class="badge badge-demo" hidden>Demo data</span>
+        <div class="export-wrap">
+          <button type="button" class="btn btn-small" id="export-btn" aria-haspopup="menu" aria-expanded="false">
+            Export
+            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="menu" id="export-menu" role="menu" hidden>
+            <button type="button" role="menuitem" data-export="pdf"><strong>PDF report</strong><small>Bar charts per sprint, ticket and day</small></button>
+            <button type="button" role="menuitem" data-export="csv"><strong>CSV for Excel</strong><small>Every worklog of the week, one per row</small></button>
+          </div>
+        </div>
       </header>
+
+      <nav class="nav" aria-label="Browse weeks">
+        <button type="button" class="icon-btn" id="nav-prev" aria-label="Previous week">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5L5.5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div class="nav-label"><h1 id="nav-title">This week</h1><span id="range" class="muted"></span></div>
+        <button type="button" class="icon-btn" id="nav-next" aria-label="Next week">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5L10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="btn btn-small" id="nav-today">This week</button>
+      </nav>
+
       <div id="days" class="card days" aria-live="polite"></div>
+      <div id="calendar" class="card calendar" hidden></div>
+      <div id="log" class="card log" hidden></div>
+      <div id="team" class="card team" hidden></div>
     </section>
 
     <aside class="side">
       <section class="card today" id="today" aria-live="polite"></section>
+      <section class="card overdue" id="overdue"></section>
       <section class="card" id="weekcard"></section>
       <section class="card" id="cats"></section>
     </aside>
@@ -103,10 +133,27 @@
         <input id="f-target" type="number" min="1" max="24" step="0.25" required>
       </label>
       <label class="field">
-        <span>Automatic updates</span>
-        <input id="f-times" type="text" spellcheck="false" placeholder="12:00, 16:00">
+        <span>Update every</span>
+        <select id="f-refresh">
+          <option value="0">Off (manual only)</option>
+          <option value="15">15 minutes</option>
+          <option value="30">30 minutes</option>
+          <option value="60">1 hour</option>
+          <option value="120">2 hours</option>
+          <option value="240">4 hours</option>
+        </select>
       </label>
     </div>
+
+    <label class="field">
+      <span>Reminder times <small class="muted">(update + notification if hours are missing)</small></span>
+      <input id="f-times" type="text" spellcheck="false" placeholder="12:00, 16:00">
+    </label>
+
+    <label class="field">
+      <span>Task counts as overdue after <small class="muted">(days past its due date)</small></span>
+      <input id="f-overdue" type="number" min="0" max="365" step="1" required>
+    </label>
 
     <label class="field">
       <span>Group hours by</span>
@@ -123,6 +170,19 @@
       <span>Custom field ID</span>
       <input id="f-custom" type="text" spellcheck="false" placeholder="customfield_12345">
     </label>
+
+    <fieldset class="field team-fields">
+      <legend>Team dashboard <small class="muted">(for admins)</small></legend>
+      <label class="field">
+        <span>Admin group <small class="muted" id="lock-admin"></small></span>
+        <input id="f-admin-group" type="text" spellcheck="false" placeholder="e.g. it-team-leads">
+      </label>
+      <label class="field">
+        <span>Team group <small class="muted" id="lock-team"></small></span>
+        <input id="f-team-group" type="text" spellcheck="false" placeholder="e.g. it-italy">
+      </label>
+      <small class="muted">Members of the admin group see everyone in the team group. Everybody else sees only their own hours. Both are Jira group names.</small>
+    </fieldset>
 
     <label class="check" id="autostart-row"><input id="f-autostart" type="checkbox"> Start with Windows</label>
     <label class="check"><input id="f-demo" type="checkbox"> Demo mode (sample data, no Jira needed)</label>

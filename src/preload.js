@@ -10,6 +10,11 @@ contextBridge.exposeInMainWorld('jwh', {
   connect: (address) => ipcRenderer.invoke('connect', address),
   disconnect: () => ipcRenderer.send('disconnect'),
   saveSettings: (input) => ipcRenderer.invoke('save-settings', input),
+  loadWeek: (weekStart) => ipcRenderer.invoke('load-week', weekStart),
+  loadMonth: (year, month) => ipcRenderer.invoke('load-month', year, month),
+  loadTeam: (weekStart) => ipcRenderer.invoke('load-team', weekStart),
+  loadOverdue: (scope) => ipcRenderer.invoke('load-overdue', scope),
+  exportReport: (kind, weekStart) => ipcRenderer.invoke('export', kind, weekStart),
   setTrayIcon: (dataUrl, tooltip) => ipcRenderer.send('tray-icon', dataUrl, tooltip),
   rendered: () => ipcRenderer.send('rendered'),
 });

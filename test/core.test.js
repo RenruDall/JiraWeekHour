@@ -23,7 +23,12 @@ function fakeJira({ cloud, repeatPages = false }) {
     { key: 'IT-117', fields: { summary: 'Admin work', customfield_10020: null } },
   ];
   const worklogs = {
-    'IT-101': [{ author: me, started: day(0), timeSpentSeconds: 4 * 3600 }, { author: other, started: day(0), timeSpentSeconds: 3600 }],
+    'IT-101': [
+      { author: me, started: day(0), timeSpentSeconds: 4 * 3600, comment: cloud
+        ? { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Reviewed DMZ rules' }] }] }
+        : 'Reviewed DMZ rules' },
+      { author: other, started: day(0), timeSpentSeconds: 3600 },
+    ],
     'IT-104': [{ author: me, started: day(0), timeSpentSeconds: 2.5 * 3600 }, { author: me, started: day(4), timeSpentSeconds: 2 * 3600 }],
     'IT-117': [{ author: me, started: day(4), timeSpentSeconds: 3 * 3600 }, { author: me, started: day(-7), timeSpentSeconds: 3600 }],
   };
@@ -162,4 +167,207 @@ test('tray icon states and demo data', () => {
   assert.strictEqual(core.trayInfo(null, { kind: 'network' }).text, '!');
   assert.strictEqual(core.formatRemaining(0.25), '0.3');
   assert.strictEqual(core.nextUpdateText(['12:00', '16:00'], new Date(2026, 8, 25, 17)), 'Next automatic update tomorrow 12:00');
+});
+
+test('reads any past week, with start times and comments', async () => {
+  for (const cloud of [false, true]) {
+    const jira = await fakeJira({ cloud });
+    try {
+      const settings = core.normalizeSettings({ baseUrl: jira.baseUrl });
+      const fetchJson = core.makeJsonFetcher(fetch, settings.baseUrl);
+      const ctx = await core.connect(fetchJson, settings);
+      // the week before the test week: only IT-117's older entry
+      const lastWeek = core.weekOf(new Date(2026, 8, 14));
+      const past = core.buildReport(await core.loadEntriesRange(fetchJson, ctx, lastWeek.from, lastWeek.to), { displayName: ctx.displayName }, settings, FRIDAY, { weekDate: new Date(2026, 8, 14) });
+      assert.strictEqual(past.weekTotal, 1);
+      assert.strictEqual(past.isCurrentWeek, false);
+      assert.strictEqual(past.today, null, 'today is not part of an older week');
+      assert.strictEqual(past.weekNumber, 38);
+
+      const week = core.weekOf(FRIDAY);
+      const entries = await core.loadEntriesRange(fetchJson, ctx, week.from, week.to);
+      const first = entries.find((e) => e.key === 'IT-101');
+      assert.strictEqual(first.time, '09:00');
+      assert.strictEqual(first.comment, 'Reviewed DMZ rules', cloud ? 'Cloud comment (document format) becomes text' : 'Data Center comment');
+      const report = core.buildReport(entries, { displayName: 'x' }, settings, FRIDAY);
+      assert.deepStrictEqual(report.log.map((e) => e.key), ['IT-101', 'IT-104', 'IT-104', 'IT-117']);
+      assert.deepStrictEqual([report.tickets[0].key, report.tickets[0].hours], ['IT-104', 4.5], 'tickets sorted by hours');
+    } finally {
+      jira.server.close();
+    }
+  }
+});
+
+test('month calendar marks days by logged hours', () => {
+  const settings = core.normalizeSettings({});
+  const entries = [
+    { day: '2026-09-21', hours: 8, key: 'A', category: 'x' },
+    { day: '2026-09-22', hours: 3, key: 'A', category: 'x' },
+    { day: '2026-09-26', hours: 1, key: 'A', category: 'x' },
+  ];
+  const m = core.buildMonth(entries, settings, FRIDAY, 2026, 8);
+  const days = Object.fromEntries(m.weeks.flatMap((w) => w.days).map((d) => [d.date, d.status]));
+  assert.strictEqual(m.weeks[0].weekStart, '2026-08-31', 'grid starts on the Monday before the 1st');
+  assert.strictEqual(days['2026-09-21'], 'done');
+  assert.strictEqual(days['2026-09-22'], 'partial');
+  assert.strictEqual(days['2026-09-23'], 'missing');
+  assert.strictEqual(days['2026-09-26'], 'future');
+  assert.strictEqual(days['2026-09-27'], 'future');
+  assert.strictEqual(days['2026-09-20'], 'weekend');
+  assert.strictEqual(m.monthTotal, 12);
+  assert.strictEqual(core.isoWeek(new Date(2027, 0, 1)), 53);
+});
+
+test('CSV export opens cleanly in Excel', () => {
+  const settings = core.normalizeSettings({});
+  const report = core.buildReport([
+    { id: '1', day: '2026-09-21', time: '08:30', key: 'IT-1', summary: 'Fix "printer"; urgent', category: 'Sprint 1', hours: 1.5, comment: 'Zeile 1\nZeile 2 – ü' },
+  ], { displayName: 'x' }, settings, FRIDAY);
+  const csv = core.exportCsv(report);
+  assert.ok(csv.startsWith('﻿Date;Start;Ticket'));
+  assert.ok(csv.includes('"Fix ""printer""; urgent"'));
+  assert.ok(csv.includes(';1,50;'));
+  assert.ok(csv.includes('"Zeile 1\nZeile 2 – ü"'));
+});
+
+test('refresh rate setting', () => {
+  assert.strictEqual(core.normalizeSettings({}).autoRefreshMinutes, 60);
+  assert.strictEqual(core.normalizeSettings({ autoRefreshMinutes: '30' }).autoRefreshMinutes, 30);
+  assert.strictEqual(core.normalizeSettings({ autoRefreshMinutes: 0 }).autoRefreshMinutes, 0);
+  assert.throws(() => core.normalizeSettings({ autoRefreshMinutes: 7 }), /refresh rate/);
+});
+
+test('demo data covers past weeks and months the same way every time', () => {
+  const settings = core.normalizeSettings({});
+  const a = core.demoReport(FRIDAY, 0, settings, new Date(2026, 7, 12));
+  const b = core.demoReport(FRIDAY, 0, settings, new Date(2026, 7, 12));
+  assert.ok(a.weekTotal > 30);
+  assert.deepStrictEqual(a.log, b.log);
+  const m = core.demoMonth(FRIDAY, 0, settings, 2026, 7);
+  assert.ok(m.monthTotal > 100);
+});
+
+// ---------------------------------------------------------------- team dashboard
+function fakeTeamJira({ cloud, listGroups = true }) {
+  const u = (id, name) => (cloud ? { accountId: `acc-${id}`, displayName: name } : { name: id, key: `KEY-${id}`, displayName: name });
+  const lead = u('lead', 'Lena Lead');
+  const anna = u('anna', 'Anna Berger');
+  const tom = u('tom', 'Tom Huber');
+  const outsider = u('olga', 'Olga Other');
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const p = url.pathname;
+    const jql = url.searchParams.get('jql') || '';
+    seen.push(`${p} ${jql}`);
+    const json = (body, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    const api = cloud ? '3' : '2';
+    if (p === '/rest/api/2/serverInfo') return json({ deploymentType: cloud ? 'Cloud' : 'DataCenter' });
+    if (p === `/rest/api/${api}/myself`) {
+      return json({ ...lead, groups: url.searchParams.get('expand') === 'groups' ? { size: 2, items: [{ name: 'IT-Leads' }, { name: 'jira-users' }] } : undefined });
+    }
+    if (p === `/rest/api/${api}/field`) return json([SPRINT_FIELD]);
+    if (p === `/rest/api/${api}/group/member`) {
+      if (!listGroups) return json({ errorMessages: ['no permission'] }, 403);
+      assert.strictEqual(url.searchParams.get('groupname'), 'it-italy');
+      return json({ values: [anna, tom, { ...u('gone', 'Gone User'), active: false }], isLast: true, total: 3 });
+    }
+    const searchPath = cloud ? '/rest/api/3/search/jql' : '/rest/api/2/search';
+    if (p === searchPath && jql.includes('duedate')) {
+      assert.ok(jql.includes('startOfDay("-3d")'), jql);
+      const team = jql.includes('membersOf("it-italy")');
+      const issues = [
+        { key: 'IT-76', fields: { summary: 'Patch firmware', duedate: '2026-09-10', assignee: tom, status: { name: 'Waiting' }, priority: { name: 'High' } } },
+        { key: 'IT-88', fields: { summary: 'Renew certificate', duedate: '2026-09-20', assignee: lead, status: { name: 'Open' }, priority: { name: 'Medium' } } },
+        // Jira gives only what the JQL asks for; this one is just 1 day late and must be filtered out anyway
+        { key: 'IT-99', fields: { summary: 'Edge case', duedate: '2026-09-24', assignee: tom, status: { name: 'Open' } } },
+      ];
+      return json(cloud ? { issues: team ? issues : [issues[1]], isLast: true } : { total: 3, issues: team ? issues : [issues[1]] });
+    }
+    if (p === searchPath) {
+      assert.ok(jql.startsWith('worklogAuthor in membersOf("it-italy")'), jql);
+      const issues = [{ key: 'IT-1', fields: { summary: 'Shared ticket', customfield_10020: [{ name: 'Sprint 5' }] } }];
+      return json(cloud ? { issues, isLast: true } : { total: 1, issues });
+    }
+    if (p === `/rest/api/${api}/issue/IT-1/worklog`) {
+      return json({ total: 4, worklogs: [
+        { id: 1, author: anna, started: day(0), timeSpentSeconds: 8 * 3600 },
+        { id: 2, author: tom, started: day(0), timeSpentSeconds: 3 * 3600 },
+        { id: 3, author: tom, started: day(1), timeSpentSeconds: 5 * 3600 },
+        { id: 4, author: outsider, started: day(0), timeSpentSeconds: 2 * 3600 },
+      ] });
+    }
+    return json({ errorMessages: ['not found'] }, 404);
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, seen, baseUrl: `http://127.0.0.1:${server.address().port}` })));
+}
+
+for (const cloud of [false, true]) {
+  test(`team dashboard on Jira ${cloud ? 'Cloud' : 'Data Center'}`, async () => {
+    const jira = await fakeTeamJira({ cloud });
+    try {
+      const settings = core.normalizeSettings({ baseUrl: jira.baseUrl, adminGroup: 'it-leads', teamGroup: 'it-italy' });
+      const fetchJson = core.makeJsonFetcher(fetch, settings.baseUrl);
+      const ctx = await core.connect(fetchJson, settings);
+      assert.ok(core.isAdminOf(ctx, settings.adminGroup), 'group names compare case-insensitively');
+      assert.ok(!core.isAdminOf(ctx, 'it-italy'));
+      assert.ok(!core.isAdminOf(ctx, ''), 'no admin group configured = nobody is admin');
+
+      const members = await core.loadGroupMembers(fetchJson, ctx, settings.teamGroup);
+      assert.deepStrictEqual(members.map((m) => m.displayName), ['Anna Berger', 'Tom Huber'], 'inactive users are left out');
+
+      const week = core.weekOf(FRIDAY);
+      const entries = await core.loadEntriesRange(fetchJson, ctx, week.from, week.to, { group: settings.teamGroup, members });
+      const team = core.buildTeamWeek(entries, members, settings, FRIDAY);
+      assert.deepStrictEqual(team.rows.map((r) => [r.displayName, r.total]), [['Anna Berger', 8], ['Tom Huber', 8]]);
+      assert.strictEqual(team.rows[1].days[0].status, 'partial');
+      assert.strictEqual(team.rows[0].days[0].status, 'done');
+      assert.strictEqual(team.rows[0].days[1].status, 'missing');
+      assert.strictEqual(team.totals.hours, 16, 'a non-member\'s worklog on the same ticket is not counted');
+      assert.strictEqual(team.rows[0].report.categories[0].name, 'Sprint 5');
+
+      const mine = await core.loadOverdue(fetchJson, ctx, settings, FRIDAY);
+      assert.deepStrictEqual(mine.map((i) => [i.key, i.daysOverdue]), [['IT-88', 5]]);
+      const teamOverdue = await core.loadOverdue(fetchJson, ctx, settings, FRIDAY, { group: settings.teamGroup });
+      assert.deepStrictEqual(teamOverdue.map((i) => [i.key, i.assignee, i.daysOverdue]), [['IT-76', 'Tom Huber', 15], ['IT-88', 'Lena Lead', 5]]);
+    } finally {
+      jira.server.close();
+    }
+  });
+}
+
+test('team dashboard still works when Jira does not allow listing group members', async () => {
+  const jira = await fakeTeamJira({ cloud: false, listGroups: false });
+  try {
+    const settings = core.normalizeSettings({ baseUrl: jira.baseUrl, adminGroup: 'it-leads', teamGroup: 'it-italy' });
+    const fetchJson = core.makeJsonFetcher(fetch, settings.baseUrl);
+    const ctx = await core.connect(fetchJson, settings);
+    const members = await core.loadGroupMembers(fetchJson, ctx, settings.teamGroup);
+    assert.strictEqual(members, null);
+    const week = core.weekOf(FRIDAY);
+    const entries = await core.loadEntriesRange(fetchJson, ctx, week.from, week.to, { group: settings.teamGroup, members: null });
+    const team = core.buildTeamWeek(entries, null, settings, FRIDAY);
+    assert.strictEqual(team.membersKnown, false);
+    // without the member list, everyone Jira returned for membersOf() is shown
+    assert.deepStrictEqual(team.rows.map((r) => r.displayName), ['Anna Berger', 'Olga Other', 'Tom Huber']);
+  } finally {
+    jira.server.close();
+  }
+});
+
+test('overdue setting and group names in JQL', () => {
+  assert.strictEqual(core.normalizeSettings({}).overdueDays, 3);
+  assert.strictEqual(core.normalizeSettings({ overdueDays: 0 }).overdueDays, 0);
+  assert.throws(() => core.normalizeSettings({ overdueDays: -1 }), /Overdue after/);
+  assert.throws(() => core.normalizeSettings({ overdueDays: 2.5 }), /Overdue after/);
+  assert.strictEqual(core.jqlString('it "team"'), '"it \\"team\\""', 'quotes inside a group name are escaped');
+  const items = core.overdueItems([{ key: 'A-1', due: '2026-09-21' }, { key: 'A-2', due: '2026-09-22' }, { key: 'A-3', due: '' }], core.normalizeSettings({ overdueDays: 3 }), FRIDAY);
+  assert.deepStrictEqual(items.map((i) => [i.key, i.daysOverdue]), [['A-1', 4]]);
+});
+
+test('reads IT policy from the registry output', () => {
+  const { parseRegQuery } = require('../src/policy');
+  const out = '\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\JiraWeekHours\r\n    AdminGroup    REG_SZ    it-leads\r\n    TeamGroup    REG_SZ    IT Italy\r\n    Other    REG_DWORD    0x1\r\n    BaseUrl    REG_SZ    \r\n';
+  assert.deepStrictEqual(parseRegQuery(out), { adminGroup: 'it-leads', teamGroup: 'IT Italy' });
+  assert.deepStrictEqual(parseRegQuery(''), {});
 });

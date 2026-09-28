@@ -1,14 +1,18 @@
 'use strict';
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, session, safeStorage, powerMonitor } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, session, safeStorage, powerMonitor, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const core = require('./core');
 const { handleSquirrelEvent } = require('./squirrel');
 const { getAutostart, setAutostart } = require('./autostart');
+const { readPolicy } = require('./policy');
 
 const APP_NAME = 'Jira Week Hours';
 const START_HIDDEN = process.argv.includes('--hidden');
-const CAPTURE = (process.argv.find((a) => a.startsWith('--capture=')) || '').slice('--capture='.length); // dev: screenshot and quit
+const argValue = (name) => (process.argv.find((a) => a.startsWith(`--${name}=`)) || '').slice(name.length + 3);
+const CAPTURE = argValue('capture');           // dev: screenshot the window and quit
+const CAPTURE_VIEW = argValue('capture-view'); // dev: open this view first (week, calendar, log)
+const CAPTURE_PDF = argValue('capture-pdf');   // dev: write the PDF report here and quit
 
 if (handleSquirrelEvent()) {
   // Started by the installer (install, update, uninstall): nothing else to do
@@ -33,6 +37,9 @@ const doneSlots = new Set();
 const state = {
   report: null, error: null, updating: false, lastUpdate: null, lastReason: null,
   lastLogged: null, lastDate: null, sinceLast: null, settingsWarning: null,
+  ctx: null, // who we are and which Jira; reused for every week and month
+  policy: {}, // settings fixed by IT in the registry
+  members: null, // team members, cached per session
 };
 
 // ---------------------------------------------------------------- settings
@@ -45,10 +52,10 @@ function loadSettings() {
   try { raw = JSON.parse(fs.readFileSync(settingsFile(), 'utf8')); } catch { /* first run */ }
   try {
     state.settingsWarning = null;
-    return core.normalizeSettings(raw);
+    return core.normalizeSettings({ ...raw, ...state.policy });
   } catch (err) {
     state.settingsWarning = `Settings problem: ${err.message} Using defaults until fixed.`;
-    return core.normalizeSettings({});
+    return core.normalizeSettings({ ...state.policy });
   }
 }
 
@@ -100,7 +107,12 @@ async function refresh(reason) {
     } else if (!settings.baseUrl) {
       throw new core.JiraError('setup', 'No Jira connected yet.');
     } else {
-      report = await core.loadReport(makeFetcher(settings), settings, new Date());
+      const fetchJson = makeFetcher(settings);
+      const ctx = await jiraContext(fetchJson, settings);
+      const now = new Date();
+      const week = core.weekOf(now);
+      report = core.buildReport(await core.loadEntriesRange(fetchJson, ctx, week.from, week.to), { displayName: ctx.displayName }, settings, now);
+      report.deployment = ctx.deployment;
     }
     const todayKey = core.dateKey(new Date());
     const sameDay = state.lastDate === todayKey;
@@ -115,6 +127,7 @@ async function refresh(reason) {
     }
   } catch (err) {
     state.error = { kind: err.kind || 'other', message: err.message || String(err) };
+    state.ctx = null; // connect again next time (new sign-in, changed token, ...)
     if (state.error.kind === 'setup') state.report = null;
     if (reason !== 'startup' && state.error.kind !== 'setup') notify('Jira hours', `Update failed: ${state.error.message}`, 'warning');
   } finally {
@@ -125,7 +138,76 @@ async function refresh(reason) {
   }
 }
 
+async function jiraContext(fetchJson, settings) {
+  const key = `${settings.baseUrl}|${settings.auth}|${settings.email}|${settings.categoryField}`;
+  if (!state.ctx || state.ctx.key !== key) state.ctx = { key, ...(await core.connect(fetchJson, settings)) };
+  return state.ctx;
+}
+
+// Any week (by its Monday, "YYYY-MM-DD") for browsing back; the current week comes from the last update
+async function loadWeek(weekStart) {
+  const settings = loadSettings();
+  const weekDate = core.parseDateKey(weekStart) || new Date();
+  const now = new Date();
+  if (settings.demo) return core.demoReport(now, demoBumps, settings, weekDate);
+  if (core.weekOf(weekDate).from === core.weekOf(now).from && state.report && !state.report.demo) return state.report;
+  const fetchJson = makeFetcher(settings);
+  const ctx = await jiraContext(fetchJson, settings);
+  const week = core.weekOf(weekDate);
+  const report = core.buildReport(await core.loadEntriesRange(fetchJson, ctx, week.from, week.to), { displayName: ctx.displayName }, settings, now, { weekDate });
+  report.deployment = ctx.deployment;
+  return report;
+}
+
+async function loadMonth(year, month) {
+  const settings = loadSettings();
+  const now = new Date();
+  if (settings.demo) return core.demoMonth(now, demoBumps, settings, year, month);
+  const fetchJson = makeFetcher(settings);
+  const ctx = await jiraContext(fetchJson, settings);
+  const grid = core.monthGrid(year, month);
+  return core.buildMonth(await core.loadEntriesRange(fetchJson, ctx, grid.from, grid.to), settings, now, year, month);
+}
+
+function isAdmin(settings) {
+  if (settings.demo) return true; // the demo shows the team view with sample colleagues
+  return core.isAdminOf(state.ctx, settings.adminGroup);
+}
+
+async function loadTeamWeek(weekStart) {
+  const settings = loadSettings();
+  const weekDate = core.parseDateKey(weekStart) || new Date();
+  if (settings.demo) return core.demoTeamWeek(new Date(), demoBumps, settings, weekDate);
+  const fetchJson = makeFetcher(settings);
+  const ctx = await jiraContext(fetchJson, settings);
+  if (!core.isAdminOf(ctx, settings.adminGroup)) throw new Error('Only members of the admin group can see the team dashboard.');
+  if (!settings.teamGroup) throw new Error('No team group set. Add it in Settings.');
+  if (!state.members || state.members.group !== settings.teamGroup) {
+    state.members = { group: settings.teamGroup, list: await core.loadGroupMembers(fetchJson, ctx, settings.teamGroup) };
+  }
+  const week = core.weekOf(weekDate);
+  const entries = await core.loadEntriesRange(fetchJson, ctx, week.from, week.to, { group: settings.teamGroup, members: state.members.list });
+  return core.buildTeamWeek(entries, state.members.list, settings, new Date(), { weekDate });
+}
+
+async function loadOverdue(scope) {
+  const settings = loadSettings();
+  const now = new Date();
+  const team = scope === 'team';
+  if (settings.demo) return core.demoOverdue(now, settings, team);
+  const fetchJson = makeFetcher(settings);
+  const ctx = await jiraContext(fetchJson, settings);
+  if (team) {
+    if (!core.isAdminOf(ctx, settings.adminGroup)) throw new Error('Only members of the admin group can see the team\'s overdue tasks.');
+    if (!settings.teamGroup) throw new Error('No team group set. Add it in Settings.');
+    return core.loadOverdue(fetchJson, ctx, settings, now, { group: settings.teamGroup });
+  }
+  return core.loadOverdue(fetchJson, ctx, settings, now);
+}
+
 function resetProgress() {
+  state.ctx = null;
+  state.members = null;
   demoBumps = 0;
   state.lastLogged = null;
   state.sinceLast = null;
@@ -145,7 +227,10 @@ function pushState() {
     lastUpdate: state.lastUpdate,
     lastReason: state.lastReason,
     sinceLast: state.sinceLast,
-    nextUpdate: core.nextUpdateText(settings.refreshTimes, new Date()),
+    nextUpdate: scheduleText(settings),
+    startView: CAPTURE_VIEW || null,
+    isAdmin: isAdmin(settings),
+    policy: Object.keys(state.policy),
     settingsWarning: state.settingsWarning,
     tray: core.trayInfo(state.report, state.error),
     platform: process.platform,
@@ -174,12 +259,26 @@ function dueSlot(settings) {
   return null;
 }
 
+function autoRefreshDue(settings) {
+  if (!settings.autoRefreshMinutes || !state.lastUpdate || state.updating) return false;
+  return Date.now() - new Date(state.lastUpdate).getTime() >= settings.autoRefreshMinutes * 60 * 1000;
+}
+
+function scheduleText(settings) {
+  const parts = [];
+  if (settings.autoRefreshMinutes) parts.push(`Updates every ${settings.autoRefreshMinutes < 60 ? `${settings.autoRefreshMinutes} min` : `${settings.autoRefreshMinutes / 60} h`}`);
+  parts.push(core.nextUpdateText(settings.refreshTimes, new Date()).replace('Next automatic update', 'next reminder'));
+  const text = parts.join(' \u00b7 ');
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 function tick() {
   const settings = loadSettings();
   const slot = dueSlot(settings);
   if (slot) refresh(`scheduled ${slot}`);
   else if (state.lastDate && state.lastDate !== core.dateKey(new Date())) refresh('new day');
-  else pushState(); // keeps "next automatic update" current
+  else if (autoRefreshDue(settings)) refresh('automatic');
+  else pushState(); // keeps the schedule text current
 }
 
 // ------------------------------------------------------------------ windows
@@ -308,8 +407,55 @@ function setTrayIcon(dataUrl, tooltip) {
   tray.setContextMenu(buildTrayMenu());
 }
 
+// ------------------------------------------------------------------- export
+const exportName = (report, ext) => `Jira-hours-${report.weekStart.slice(0, 4)}-W${String(report.weekNumber).padStart(2, '0')}.${ext}`;
+
+async function renderPdf(report) {
+  const win = new BrowserWindow({
+    show: false,
+    width: 900,
+    height: 1200,
+    webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false },
+  });
+  try {
+    await win.loadFile(path.join(__dirname, 'ui', 'report.html'));
+    const settings = loadSettings();
+    const data = { report, groupLabel: settings.categoryField === 'sprint' ? 'Sprint' : 'Category', createdAt: new Date().toISOString() };
+    await win.webContents.executeJavaScript(`window.renderReport(${JSON.stringify(data)}); true;`);
+    return await win.webContents.printToPDF({ pageSize: 'A4', printBackground: true, margins: { marginType: 'custom', top: 0.4, bottom: 0.4, left: 0.4, right: 0.4 } });
+  } finally {
+    win.destroy();
+  }
+}
+
+async function exportReport(kind, weekStart) {
+  const report = await loadWeek(weekStart);
+  const isPdf = kind === 'pdf';
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: isPdf ? 'Save PDF report' : 'Save CSV for Excel',
+    defaultPath: path.join(app.getPath('documents'), exportName(report, isPdf ? 'pdf' : 'csv')),
+    filters: isPdf ? [{ name: 'PDF', extensions: ['pdf'] }] : [{ name: 'CSV (Excel)', extensions: ['csv'] }],
+  });
+  if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+  fs.writeFileSync(result.filePath, isPdf ? await renderPdf(report) : core.exportCsv(report));
+  if (isPdf) shell.openPath(result.filePath);
+  else shell.showItemInFolder(result.filePath);
+  return { ok: true, filePath: result.filePath };
+}
+
 // ---------------------------------------------------------------------- IPC
 function registerIpc() {
+  const safely = (fn) => async (...args) => {
+    try { return { ok: true, data: await fn(...args) }; } catch (err) { return { ok: false, message: err.message || String(err), kind: err.kind }; }
+  };
+  ipcMain.handle('load-week', (_e, weekStart) => safely(loadWeek)(String(weekStart || '')));
+  ipcMain.handle('load-month', (_e, year, month) => safely(loadMonth)(Number(year), Number(month)));
+  ipcMain.handle('load-team', (_e, weekStart) => safely(loadTeamWeek)(String(weekStart || '')));
+  ipcMain.handle('load-overdue', (_e, scope) => safely(loadOverdue)(scope === 'team' ? 'team' : 'me'));
+  ipcMain.handle('export', async (_e, kind, weekStart) => {
+    try { return await exportReport(kind === 'pdf' ? 'pdf' : 'csv', String(weekStart || '')); } catch (err) { return { ok: false, message: err.message || String(err) }; }
+  });
+
   ipcMain.on('ready', () => pushState());
   ipcMain.on('refresh', () => refresh('manual'));
   ipcMain.on('sign-in', () => openLogin());
@@ -322,7 +468,7 @@ function registerIpc() {
   ipcMain.handle('connect', async (_e, address) => {
     try {
       const current = loadSettings();
-      const next = core.normalizeSettings({ ...current, baseUrl: address, auth: 'browser', demo: false });
+      const next = core.normalizeSettings({ ...current, baseUrl: address, auth: 'browser', demo: false, ...state.policy });
       if (!next.baseUrl) throw new Error('Please enter your Jira address.');
       writeSettings(next);
       resetProgress();
@@ -336,12 +482,13 @@ function registerIpc() {
   ipcMain.handle('save-settings', async (_e, input) => {
     try {
       const current = loadSettings();
-      const next = core.normalizeSettings({ ...current, ...input.settings });
+      const next = core.normalizeSettings({ ...current, ...input.settings, ...state.policy }); // IT policy always wins
       if (next.auth === 'token' && input.token) saveToken(String(input.token).trim());
       if (next.auth === 'token' && !next.demo && next.baseUrl && !loadToken()) throw new Error('Paste your API token, or choose "Sign in with Jira window".');
       writeSettings(next);
       if (typeof input.autostart === 'boolean') setAutostart(input.autostart);
-      if (next.demo !== current.demo || next.baseUrl !== current.baseUrl) resetProgress();
+      if (next.demo !== current.demo || next.baseUrl !== current.baseUrl || next.categoryField !== current.categoryField) resetProgress();
+      if (next.teamGroup !== current.teamGroup || next.adminGroup !== current.adminGroup) state.members = null;
       refresh('settings');
       return { ok: true };
     } catch (err) {
@@ -350,6 +497,12 @@ function registerIpc() {
   });
 
   ipcMain.on('rendered', () => {
+    if (CAPTURE_PDF) {
+      const day = new Date();
+      if (CAPTURE_VIEW === 'past') day.setDate(day.getDate() - 7);
+      loadWeek(core.dateKey(day)).then(renderPdf).then((pdf) => { fs.writeFileSync(CAPTURE_PDF, pdf); quitting = true; app.quit(); });
+      return;
+    }
     if (!CAPTURE) return;
     setTimeout(async () => {
       const image = await mainWindow.webContents.capturePage();
@@ -362,6 +515,7 @@ function registerIpc() {
 
 // -------------------------------------------------------------------- start
 function start() {
+  state.policy = readPolicy();
   registerIpc();
   createMainWindow();
 

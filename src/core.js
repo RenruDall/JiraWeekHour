@@ -8,9 +8,15 @@ const DEFAULTS = Object.freeze({
   email: '',                  // Jira Cloud API tokens need the account e-mail; leave empty for Data Center tokens
   targetHours: 8,
   categoryField: 'sprint',    // sprint, issuetype, project, components, labels or customfield_12345
-  refreshTimes: ['12:00', '16:00'],
+  refreshTimes: ['12:00', '16:00'], // reminder times: update + notification if hours are missing
+  autoRefreshMinutes: 60,     // silent background update; 0 = off
+  overdueDays: 3,             // a task counts as overdue when its due date is more than this many days ago
+  adminGroup: '',             // members of this Jira group see the team dashboard (empty = off)
+  teamGroup: '',              // the Jira group whose members the team dashboard shows
   demo: false,
 });
+
+const REFRESH_CHOICES = [0, 15, 30, 60, 120, 240];
 
 class JiraError extends Error {
   constructor(kind, message) {
@@ -73,7 +79,15 @@ function normalizeSettings(raw) {
   }
   const refreshTimes = [...new Set(times)].sort();
 
-  return { baseUrl, auth, email, targetHours, categoryField, refreshTimes, demo: !!s.demo };
+  const autoRefreshMinutes = Number(s.autoRefreshMinutes);
+  if (!REFRESH_CHOICES.includes(autoRefreshMinutes)) throw new Error(`The refresh rate must be one of ${REFRESH_CHOICES.join(', ')} minutes.`);
+
+  const overdueDays = Number(s.overdueDays);
+  if (!(Number.isInteger(overdueDays) && overdueDays >= 0 && overdueDays <= 365)) throw new Error('"Overdue after" must be a whole number of days between 0 and 365.');
+  const adminGroup = String(s.adminGroup || '').trim().slice(0, 255);
+  const teamGroup = String(s.teamGroup || '').trim().slice(0, 255);
+
+  return { baseUrl, auth, email, targetHours, categoryField, refreshTimes, autoRefreshMinutes, overdueDays, adminGroup, teamGroup, demo: !!s.demo };
 }
 
 // ------------------------------------------------------------------- dates
@@ -100,6 +114,32 @@ function weekOf(now) {
     to: dateKey(days[6]),
     label: `${shortDate(days[0])} – ${shortDate(days[6])}.${days[6].getFullYear()}`,
   };
+}
+
+// Parses "2026-09-21" as a local date
+function parseDateKey(key) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(key || ''));
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+// ISO 8601 week number (weeks start on Monday, week 1 contains the first Thursday)
+function isoWeek(date) {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = (d.getUTCDay() + 6) % 7;
+  d.setUTCDate(d.getUTCDate() - dayNum + 3);
+  const firstThursday = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+  return 1 + Math.round(((d - firstThursday) / 86400000 - 3 + ((firstThursday.getUTCDay() + 6) % 7)) / 7);
+}
+
+// The calendar grid for a month: whole weeks from the Monday before the 1st to the Sunday after the last day
+function monthGrid(year, month) {
+  const first = new Date(year, month, 1);
+  const last = new Date(year, month + 1, 0);
+  const start = weekOf(first).days[0];
+  const end = weekOf(last).days[6];
+  return { from: dateKey(start), to: dateKey(end), start, end, first, last };
 }
 
 // Next automatic update, as text for the status bar
@@ -188,7 +228,7 @@ async function searchIssues(fetchJson, deployment, jql, fields) {
       if (!token || page.isLast) break;
     }
   } else {
-    for (let startAt = 0; ;) {
+    for (let startAt = 0, guard = 0; guard < 200; guard++) {
       const page = await fetchJson(`/rest/api/2/search?${q}&startAt=${startAt}`);
       const got = Array.isArray(page.issues) ? page.issues : [];
       issues.push(...got);
@@ -196,16 +236,81 @@ async function searchIssues(fetchJson, deployment, jql, fields) {
       if (!got.length || startAt >= (page.total || 0)) break;
     }
   }
-  return issues;
+  // Never list the same issue twice, even if a server repeats a page
+  const seen = new Set();
+  return issues.filter((i) => i && i.key && !seen.has(i.key) && seen.add(i.key));
 }
 
-async function loadEntries(fetchJson, deployment, settings, week, me) {
+// Worklog comments: plain text on Data Center, Atlassian Document Format (JSON) on Cloud
+function commentText(comment) {
+  if (!comment) return '';
+  if (typeof comment === 'string') return comment.trim();
+  const parts = [];
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'text' && node.text) parts.push(node.text);
+    if (node.type === 'hardBreak') parts.push('\n');
+    if (Array.isArray(node.content)) {
+      node.content.forEach(walk);
+      if (['paragraph', 'heading', 'listItem'].includes(node.type)) parts.push('\n');
+    }
+  };
+  walk(comment);
+  return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Who we are and which Jira we talk to; done once per session, then reused for every date range
+async function connect(fetchJson, settings) {
+  if (!settings.baseUrl) throw new JiraError('setup', 'No Jira connected yet.');
+  const deployment = await detectDeployment(fetchJson, settings.baseUrl);
   const api = deployment === 'cloud' ? 3 : 2;
-  const jql = `worklogAuthor = currentUser() AND worklogDate >= "${week.from}" AND worklogDate <= "${week.to}"`;
+  const me = await fetchJson(`/rest/api/${api}/myself?expand=groups`);
   const category = await resolveCategoryField(fetchJson, api, settings.categoryField);
-  const issues = await searchIssues(fetchJson, deployment, jql, category.id ? `summary,${category.id}` : 'summary');
+  const groups = (me.groups && Array.isArray(me.groups.items) ? me.groups.items : []).map((g) => String(g.name || '').toLowerCase()).filter(Boolean);
+  return { deployment, api, me, category, groups, displayName: me.displayName || me.name || 'you' };
+}
+
+// Admin = member of the configured Jira group (checked by Jira, not by the app)
+function isAdminOf(ctx, adminGroup) {
+  return !!(adminGroup && ctx && Array.isArray(ctx.groups) && ctx.groups.includes(String(adminGroup).toLowerCase()));
+}
+
+const userKey = (u) => (u ? String(u.accountId || u.key || u.name || '') : '');
+const jqlString = (text) => `"${String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+
+// Members of a Jira group. Returns null when Jira does not allow listing groups (then the
+// dashboard falls back to everyone who logged time).
+async function loadGroupMembers(fetchJson, ctx, group) {
+  const members = [];
+  try {
+    for (let startAt = 0, guard = 0; guard < 40; guard++) {
+      const page = await fetchJson(`/rest/api/${ctx.api}/group/member?groupname=${encodeURIComponent(group)}&includeInactiveUsers=false&startAt=${startAt}&maxResults=50`);
+      const values = Array.isArray(page.values) ? page.values : [];
+      for (const u of values) {
+        if (u.active === false) continue;
+        members.push({ id: userKey(u), displayName: u.displayName || u.name || userKey(u) });
+      }
+      startAt += values.length;
+      if (!values.length || page.isLast || startAt >= (page.total || 0)) break;
+    }
+  } catch (err) {
+    if (err.kind === 'auth' || err.kind === 'http') return null;
+    throw err;
+  }
+  return members.sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+// Worklogs between two dates (inclusive, "YYYY-MM-DD"): mine, or a whole group's (opts.group)
+async function loadEntriesRange(fetchJson, ctx, from, to, opts = {}) {
+  const who = opts.group ? `worklogAuthor in membersOf(${jqlString(opts.group)})` : 'worklogAuthor = currentUser()';
+  const jql = `${who} AND worklogDate >= "${from}" AND worklogDate <= "${to}"`;
+  const { category, me, api } = ctx;
+  const issues = await searchIssues(fetchJson, ctx.deployment, jql, category.id ? `summary,${category.id}` : 'summary');
 
   const isMine = (a) => !!a && ((me.accountId && a.accountId === me.accountId) || (me.key && a.key === me.key) || (me.name && a.name === me.name));
+  // Team mode: keep entries of group members (or of everyone found, when the member list is unknown)
+  const memberIds = opts.members ? new Set(opts.members.map((m) => m.id)) : null;
+  const wanted = opts.group ? (a) => !!a && (!memberIds || memberIds.has(userKey(a))) : isMine;
   const entries = [];
   for (const issue of issues) {
     const raw = issue.fields && category.id ? issue.fields[category.id] : null;
@@ -220,10 +325,22 @@ async function loadEntries(fetchJson, deployment, settings, week, me) {
       if (logs.length && !fresh.length) break;
       for (const w of fresh) {
         if (w.id !== undefined) seenIds.add(String(w.id));
-        if (!isMine(w.author)) continue;
-        const day = String(w.started || '').slice(0, 10);
-        if (day < week.from || day > week.to) continue;
-        entries.push({ day, key: issue.key, summary, category: categoryText, hours: (Number(w.timeSpentSeconds) || 0) / 3600 });
+        if (!wanted(w.author)) continue;
+        const started = String(w.started || '');
+        const day = started.slice(0, 10);
+        if (day < from || day > to) continue;
+        entries.push({
+          id: w.id !== undefined ? String(w.id) : `${issue.key}-${started}`,
+          day,
+          time: /T\d\d:\d\d/.test(started) ? started.slice(11, 16) : '',
+          key: issue.key,
+          summary,
+          category: categoryText,
+          hours: (Number(w.timeSpentSeconds) || 0) / 3600,
+          comment: commentText(w.comment),
+          user: userKey(w.author),
+          userName: (w.author && (w.author.displayName || w.author.name)) || '',
+        });
       }
       startAt += logs.length;
       if (!logs.length || startAt >= (wl.total || 0)) break;
@@ -232,29 +349,59 @@ async function loadEntries(fetchJson, deployment, settings, week, me) {
   return entries;
 }
 
+// Current week in one call (used by tests and the first load)
 async function loadReport(fetchJson, settings, now) {
-  if (!settings.baseUrl) throw new JiraError('setup', 'No Jira connected yet.');
-  const deployment = await detectDeployment(fetchJson, settings.baseUrl);
-  const me = await fetchJson(`/rest/api/${deployment === 'cloud' ? 3 : 2}/myself`);
+  const ctx = await connect(fetchJson, settings);
   const week = weekOf(now);
-  const entries = await loadEntries(fetchJson, deployment, settings, week, me);
-  const report = buildReport(entries, { displayName: me.displayName || me.name || 'you' }, settings, now);
-  report.deployment = deployment;
+  const entries = await loadEntriesRange(fetchJson, ctx, week.from, week.to);
+  const report = buildReport(entries, { displayName: ctx.displayName }, settings, now);
+  report.deployment = ctx.deployment;
   return report;
+}
+
+// Unresolved tasks whose due date is more than settings.overdueDays days ago
+async function loadOverdue(fetchJson, ctx, settings, now, opts = {}) {
+  const who = opts.group ? `assignee in membersOf(${jqlString(opts.group)})` : 'assignee = currentUser()';
+  const jql = `${who} AND resolution = Unresolved AND duedate < startOfDay("-${settings.overdueDays}d") ORDER BY duedate ASC`;
+  const issues = await searchIssues(fetchJson, ctx.deployment, jql, 'summary,duedate,assignee,status,priority');
+  return overdueItems(issues.map((i) => ({
+    key: i.key,
+    summary: (i.fields && i.fields.summary) || '',
+    due: (i.fields && i.fields.duedate) || '',
+    assignee: (i.fields && i.fields.assignee && (i.fields.assignee.displayName || i.fields.assignee.name)) || 'Unassigned',
+    status: (i.fields && i.fields.status && i.fields.status.name) || '',
+    priority: (i.fields && i.fields.priority && i.fields.priority.name) || '',
+  })), settings, now);
+}
+
+function overdueItems(items, settings, now) {
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return items
+    .map((it) => {
+      const due = parseDateKey(String(it.due).slice(0, 10));
+      return { ...it, due: due ? dateKey(due) : '', daysOverdue: due ? Math.round((today - due) / 86400000) : 0 };
+    })
+    .filter((it) => it.due && it.daysOverdue > settings.overdueDays)
+    .sort((a, b) => b.daysOverdue - a.daysOverdue || a.key.localeCompare(b.key, undefined, { numeric: true }))
+    .slice(0, 200);
 }
 
 // ------------------------------------------------------------------ report
 const round2 = (n) => Math.round(n * 100) / 100;
+const byTime = (a, b) => (a.day + a.time).localeCompare(b.day + b.time) || a.key.localeCompare(b.key, undefined, { numeric: true });
 
+// Week report for the week containing opts.weekDate (default: the current week)
 function buildReport(entries, me, settings, now, opts = {}) {
-  const week = weekOf(now);
+  const week = weekOf(opts.weekDate || now);
+  const current = weekOf(now);
   const target = settings.targetHours;
-  const todayKey = dateKey(week.today);
+  const todayKey = dateKey(current.today);
+  const weekEntries = entries.filter((e) => e.day >= week.from && e.day <= week.to);
 
   const days = week.days.map((d, i) => {
     const key = dateKey(d);
     const byTicket = new Map();
-    for (const e of entries) {
+    for (const e of weekEntries) {
       if (e.day !== key) continue;
       const t = byTicket.get(e.key) || { key: e.key, summary: e.summary, category: e.category, hours: 0 };
       t.hours += e.hours;
@@ -280,26 +427,143 @@ function buildReport(entries, me, settings, now, opts = {}) {
     return { date: key, label: dayLabel(d), isToday, isWorkday, isFuture, total, missing, tickets, groups, visible: isWorkday || total > 0 };
   });
 
-  const today = days.find((d) => d.isToday);
-  const categories = new Map();
-  for (const e of entries) categories.set(e.category, (categories.get(e.category) || 0) + e.hours);
+  const sumBy = (field) => {
+    const map = new Map();
+    for (const e of weekEntries) {
+      const k = e[field];
+      const cur = map.get(k) || { name: k, hours: 0, summary: e.summary, category: e.category };
+      cur.hours += e.hours;
+      map.set(k, cur);
+    }
+    return [...map.values()].map((x) => ({ ...x, hours: round2(x.hours) })).sort((a, b) => b.hours - a.hours || String(a.name).localeCompare(String(b.name)));
+  };
+
+  // Today always refers to the real today, even while an older week is shown
+  const todayEntries = entries.filter((e) => e.day === todayKey);
+  const todayLogged = round2(todayEntries.reduce((sum, e) => sum + e.hours, 0));
+  const todayIsWorkday = ((current.today.getDay() + 6) % 7) < 5 || !!opts.forceWorkday;
+  const todayInWeek = week.from === current.from;
 
   return {
     me,
     demo: !!opts.demo,
+    weekStart: week.from,
+    weekEnd: week.to,
+    weekNumber: isoWeek(week.days[0]),
     weekLabel: week.label,
+    isCurrentWeek: todayInWeek,
+    isFutureWeek: week.from > current.from,
     target,
     days,
-    today: {
-      label: today.label,
-      logged: today.total,
-      missing: today.isWorkday ? round2(Math.max(0, target - today.total)) : 0,
-      isWeekend: !today.isWorkday,
-    },
+    today: todayInWeek ? {
+      label: dayLabel(current.today),
+      logged: todayLogged,
+      missing: todayIsWorkday ? round2(Math.max(0, target - todayLogged)) : 0,
+      isWeekend: !todayIsWorkday,
+    } : null,
     weekTotal: round2(days.reduce((sum, d) => sum + d.total, 0)),
     weekTarget: target * 5,
-    categories: [...categories.entries()].map(([name, hours]) => ({ name, hours: round2(hours) })).sort((a, b) => b.hours - a.hours),
+    categories: sumBy('category').map(({ name, hours }) => ({ name, hours })),
+    tickets: sumBy('key').map(({ name, hours, summary, category }) => ({ key: name, hours, summary, category })),
     missingDays: days.filter((d) => d.missing > 0).map((d) => ({ label: d.label, missing: d.missing })),
+    log: [...weekEntries].sort(byTime).map((e) => ({ ...e, hours: round2(e.hours) })),
+  };
+}
+
+// Month calendar: every day of the grid with its total and a status for colouring
+function buildMonth(entries, settings, now, year, month) {
+  const grid = monthGrid(year, month);
+  const todayKey = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate()));
+  const totals = new Map();
+  for (const e of entries) totals.set(e.day, (totals.get(e.day) || 0) + e.hours);
+
+  const weeks = [];
+  for (let d = new Date(grid.start); d <= grid.end; d.setDate(d.getDate() + 7)) {
+    const days = [];
+    for (let i = 0; i < 7; i++) {
+      const day = new Date(d);
+      day.setDate(d.getDate() + i);
+      const key = dateKey(day);
+      const total = round2(totals.get(key) || 0);
+      const isWorkday = i < 5;
+      const isFuture = key > todayKey;
+      let status = 'none';
+      if (isFuture) status = 'future';
+      else if (!isWorkday) status = total > 0 ? 'weekend-logged' : 'weekend';
+      else if (total >= settings.targetHours) status = 'done';
+      else if (total > 0) status = 'partial';
+      else status = 'missing';
+      days.push({ date: key, day: day.getDate(), inMonth: day.getMonth() === month, isToday: key === todayKey, total, status });
+    }
+    const monday = new Date(d);
+    weeks.push({
+      weekStart: dateKey(monday),
+      weekNumber: isoWeek(monday),
+      total: round2(days.reduce((s, x) => s + x.total, 0)),
+      days,
+    });
+  }
+  const inMonth = weeks.flatMap((w) => w.days).filter((x) => x.inMonth);
+  return {
+    year,
+    month,
+    label: new Date(year, month, 1).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }),
+    weeks,
+    monthTotal: round2(inMonth.reduce((s, x) => s + x.total, 0)),
+    missingDays: inMonth.filter((x) => x.status === 'missing' || x.status === 'partial').length,
+    pastWorkdays: inMonth.filter((x) => ['done', 'missing', 'partial'].includes(x.status)).length,
+  };
+}
+
+// Team dashboard: one row per member, one cell per day, plus each member's own week report
+function buildTeamWeek(entries, members, settings, now, opts = {}) {
+  const week = weekOf(opts.weekDate || now);
+  const current = weekOf(now);
+  const todayKey = dateKey(current.today);
+  const knownMembers = members && members.length ? members : null;
+  const list = knownMembers || [...new Map(entries.map((e) => [e.user, { id: e.user, displayName: e.userName || e.user }])).values()]
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+  const rows = list.map((m) => {
+    const mine = entries.filter((e) => e.user === m.id && e.day >= week.from && e.day <= week.to);
+    const report = buildReport(mine, { displayName: m.displayName }, settings, now, { weekDate: week.days[0] });
+    const days = report.days.map((d, i) => {
+      const isWorkday = i < 5;
+      let status;
+      if (d.isFuture) status = 'future';
+      else if (!isWorkday) status = d.total > 0 ? 'weekend-logged' : 'weekend';
+      else if (d.total >= settings.targetHours) status = 'done';
+      else if (d.total > 0) status = 'partial';
+      else status = 'missing';
+      return { date: d.date, total: d.total, status, isToday: d.date === todayKey };
+    });
+    return {
+      id: m.id,
+      displayName: m.displayName,
+      days,
+      total: report.weekTotal,
+      missing: round2(report.missingDays.reduce((s, d) => s + d.missing, 0)),
+      today: days.find((d) => d.isToday) || null,
+      report,
+    };
+  });
+
+  const isCurrent = week.from === current.from;
+  return {
+    weekStart: week.from,
+    weekNumber: isoWeek(week.days[0]),
+    weekLabel: week.label,
+    isCurrentWeek: isCurrent,
+    dayLabels: week.days.map((d) => dayLabel(d)),
+    target: settings.targetHours,
+    membersKnown: !!knownMembers,
+    rows,
+    totals: {
+      hours: round2(rows.reduce((s, r) => s + r.total, 0)),
+      missing: round2(rows.reduce((s, r) => s + r.missing, 0)),
+      onTargetToday: isCurrent ? rows.filter((r) => r.today && r.today.total >= settings.targetHours).length : null,
+      members: rows.length,
+    },
   };
 }
 
@@ -312,11 +576,24 @@ function formatRemaining(hours) {
 function trayInfo(report, error) {
   if (error && error.kind === 'setup') return { text: '?', color: 'gray', tooltip: 'Jira Week Hours: click to connect your Jira' };
   if (error) return { text: '!', color: 'red', tooltip: 'Jira hours: not reachable - click for details' };
-  if (!report) return { text: '…', color: 'gray', tooltip: 'Jira hours: loading…' };
+  if (!report || !report.today) return { text: '\u2026', color: 'gray', tooltip: 'Jira hours: loading\u2026' };
   const t = report.today;
-  if (t.isWeekend) return { text: '–', color: 'gray', tooltip: `Jira hours: weekend (${t.logged.toFixed(1)}h logged)` };
+  if (t.isWeekend) return { text: '\u2013', color: 'gray', tooltip: `Jira hours: weekend (${t.logged.toFixed(1)}h logged)` };
   if (t.missing <= 0) return { text: 'check', color: 'green', tooltip: `Jira hours: ${t.logged.toFixed(1)}h logged - done for today` };
   return { text: formatRemaining(t.missing), color: 'amber', tooltip: `Jira hours: ${t.logged.toFixed(1)}h logged - ${t.missing.toFixed(1)}h remaining` };
+}
+
+// -------------------------------------------------------------------- export
+const csvCell = (v) => {
+  const text = String(v === undefined || v === null ? '' : v);
+  return /[";\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+};
+
+// Semicolon-separated with a BOM, so Excel in German/Italian locales opens it in columns with umlauts intact
+function exportCsv(report) {
+  const rows = [['Date', 'Start', 'Ticket', 'Summary', 'Sprint / category', 'Hours', 'Comment']];
+  for (const e of report.log) rows.push([e.day, e.time, e.key, e.summary, e.category, e.hours.toFixed(2).replace('.', ','), e.comment]);
+  return '\uFEFF' + rows.map((r) => r.map(csvCell).join(';')).join('\r\n') + '\r\n';
 }
 
 // -------------------------------------------------------------------- demo
@@ -325,36 +602,133 @@ const DEMO_TICKETS = {
   'IT-104': { summary: 'VPN client rollout', category: 'Change', sprint: 'Sprint 12' },
   'IT-117': { summary: 'Endpoint compliance policy', category: 'Task', sprint: 'Sprint 11' },
   'IT-123': { summary: 'Print server outage', category: 'Incident', sprint: 'No sprint' },
+  'IT-130': { summary: 'Backup restore test', category: 'Task', sprint: 'Sprint 11' },
+  'IT-135': { summary: 'Onboarding new laptops', category: 'Service request', sprint: 'Sprint 12' },
 };
-const DEMO_WEEK = [
-  [['IT-101', 4], ['IT-104', 2.5]],
-  [['IT-101', 3], ['IT-117', 5]],
-  [['IT-117', 2], ['IT-123', 6]],
-  [['IT-101', 2.75], ['IT-123', 4.5]],
-  [['IT-101', 4], ['IT-117', 4]],
-  [],
-  [],
+const DEMO_COMMENTS = {
+  'IT-101': ['Reviewed inbound rules for the DMZ', 'Cleaned up unused NAT rules', 'Change request prepared'],
+  'IT-104': ['Rolled out to pilot group', 'Fixed MFA prompt issue', 'Updated rollout guide'],
+  'IT-117': ['Compliance baseline drafted', 'Tested policy on test devices', 'Exceptions documented'],
+  'IT-123': ['Spooler restarted, queue cleared', 'Root cause: driver update', 'Monitoring added'],
+  'IT-130': ['Restored file server share to test VM', 'Verified restore times'],
+  'IT-135': ['Prepared 4 laptops', 'Autopilot profile assigned'],
+};
+// Typical days: [ticket, hours, start time]
+const DEMO_DAYS = [
+  [['IT-101', 4, '08:30'], ['IT-104', 2.5, '13:30']],
+  [['IT-101', 3, '08:15'], ['IT-117', 5, '11:30']],
+  [['IT-117', 2, '08:45'], ['IT-123', 6, '10:45']],
+  [['IT-101', 2.75, '08:30'], ['IT-123', 4.5, '11:30']],
+  [['IT-101', 4, '08:00'], ['IT-117', 4, '12:30']],
+  [['IT-130', 3.5, '08:30'], ['IT-135', 4.5, '12:30']],
+  [['IT-104', 5, '08:15'], ['IT-130', 3, '13:45']],
+  [['IT-135', 2, '08:30'], ['IT-101', 3.5, '10:45'], ['IT-117', 2.5, '14:30']],
 ];
 
-// Sample week around today; each manual update in demo mode adds 0.5h to today
-function demoReport(now, bumps, settings) {
-  const week = weekOf(now);
-  const todayIndex = (week.today.getDay() + 6) % 7;
+// Same date, same demo day: a small stable hash of the date picks the pattern
+function demoPattern(key) {
+  let h = 0;
+  for (const c of key) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return h;
+}
+
+// Sample worklogs for any date range; today has 5h plus 0.5h per manual update
+function demoEntries(from, to, now, bumps) {
+  const todayKey = dateKey(now);
   const entries = [];
-  const add = (dayIndex, key, hours) => {
+  const add = (day, key, hours, time) => {
     const t = DEMO_TICKETS[key];
-    entries.push({ day: dateKey(week.days[dayIndex]), key, hours, summary: t.summary, category: settings.categoryField === 'sprint' ? t.sprint : t.category });
+    const comments = DEMO_COMMENTS[key] || [''];
+    const comment = comments[demoPattern(day + key) % comments.length];
+    entries.push({ id: `${day}-${key}-${time}`, day, time, key, hours, summary: t.summary, category: t.category, sprint: t.sprint, comment });
   };
-  for (let i = 0; i < todayIndex; i++) for (const [key, hours] of DEMO_WEEK[i]) add(i, key, hours);
-  add(todayIndex, 'IT-104', 2);
-  add(todayIndex, 'IT-117', 3);
-  if (bumps > 0) add(todayIndex, 'IT-123', Math.min(bumps * 0.5, 6));
-  const report = buildReport(entries, { displayName: 'Demo user' }, settings, now, { forceWorkday: true, demo: true });
+  const start = parseDateKey(from);
+  const end = parseDateKey(to);
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const key = dateKey(d);
+    if (key > todayKey) break;
+    if (key === todayKey) {
+      add(key, 'IT-104', 2, '08:30');
+      add(key, 'IT-117', 3, '10:45');
+      if (bumps > 0) add(key, 'IT-123', Math.min(bumps * 0.5, 6), '14:00');
+      continue;
+    }
+    if ((d.getDay() + 6) % 7 >= 5) continue; // no weekend work in the demo
+    for (const [ticket, hours, time] of DEMO_DAYS[demoPattern(key) % DEMO_DAYS.length]) add(key, ticket, hours, time);
+  }
+  return entries;
+}
+
+function demoForSettings(entries, settings) {
+  return entries.map((e) => ({ ...e, category: settings.categoryField === 'sprint' ? e.sprint : e.category }));
+}
+
+function demoReport(now, bumps, settings, weekDate) {
+  const week = weekOf(weekDate || now);
+  const current = weekOf(now);
+  const from = week.from < current.from ? week.from : current.from;
+  const to = week.to > current.to ? week.to : current.to;
+  const entries = demoForSettings(demoEntries(from, to, now, bumps), settings);
+  const report = buildReport(entries, { displayName: 'Demo user' }, settings, now, { forceWorkday: true, demo: true, weekDate });
   report.deployment = 'demo';
   return report;
 }
 
+const DEMO_TEAM = [
+  { id: 'demo-anna', displayName: 'Anna Berger' },
+  { id: 'demo-luca', displayName: 'Luca Rossi' },
+  { id: 'demo-me', displayName: 'Demo user' },
+  { id: 'demo-sara', displayName: 'Sara Kofler' },
+  { id: 'demo-tom', displayName: 'Tom Huber' },
+];
+
+// Each demo colleague has a habit: some always complete, some forget Fridays, one logs short days
+function demoTeamEntries(from, to, now, bumps, settings) {
+  const entries = [];
+  const todayKey = dateKey(now);
+  for (const m of DEMO_TEAM) {
+    const base = m.id === 'demo-me' ? demoEntries(from, to, now, bumps) : demoEntries(from, to, now, 0);
+    const dayTotals = new Map();
+    for (const e of base) dayTotals.set(e.day, (dayTotals.get(e.day) || 0) + e.hours);
+    for (const e of demoForSettings(base, settings)) {
+      const weekday = (parseDateKey(e.day).getDay() + 6) % 7;
+      let hours = e.hours;
+      if (m.id === 'demo-luca' && weekday === 4 && e.day !== todayKey) continue;   // forgets Fridays
+      if (m.id === 'demo-tom') hours = Math.round(hours * 0.8 * 4) / 4;           // short days
+      if (m.id === 'demo-sara' && e.day === todayKey) continue;                     // hasn't logged today yet
+      if (m.id === 'demo-anna' && e.day !== todayKey) hours = (e.hours * 8) / dayTotals.get(e.day); // always complete
+      entries.push({ ...e, id: `${m.id}-${e.id}`, hours, user: m.id, userName: m.displayName });
+    }
+  }
+  return entries;
+}
+
+function demoTeamWeek(now, bumps, settings, weekDate) {
+  const week = weekOf(weekDate || now);
+  return buildTeamWeek(demoTeamEntries(week.from, week.to, now, bumps, settings), DEMO_TEAM, settings, now, { weekDate });
+}
+
+function demoOverdue(now, settings, team) {
+  const ago = (n) => { const d = new Date(now); d.setDate(d.getDate() - n); return dateKey(d); };
+  const all = [
+    { key: 'IT-88', summary: 'Renew wildcard TLS certificate', due: ago(12), assignee: 'Demo user', status: 'In Progress', priority: 'High' },
+    { key: 'IT-97', summary: 'Decommission old file server', due: ago(5), assignee: 'Demo user', status: 'Open', priority: 'Medium' },
+    { key: 'IT-102', summary: 'Update network documentation', due: ago(2), assignee: 'Demo user', status: 'Open', priority: 'Low' },
+    { key: 'IT-76', summary: 'Patch firewall firmware', due: ago(20), assignee: 'Tom Huber', status: 'Waiting', priority: 'High' },
+    { key: 'IT-91', summary: 'Printer rollout floor 2', due: ago(8), assignee: 'Luca Rossi', status: 'In Progress', priority: 'Medium' },
+    { key: 'IT-99', summary: 'Access review Q3', due: ago(4), assignee: 'Sara Kofler', status: 'Open', priority: 'High' },
+  ];
+  return overdueItems(team ? all : all.filter((i) => i.assignee === 'Demo user'), settings, now);
+}
+
+function demoMonth(now, bumps, settings, year, month) {
+  const grid = monthGrid(year, month);
+  return buildMonth(demoForSettings(demoEntries(grid.from, grid.to, now, bumps), settings), settings, now, year, month);
+}
+
 module.exports = {
-  DEFAULTS, JiraError, cleanBaseUrl, normalizeSettings, weekOf, dateKey, nextUpdateText, fieldText, sprintText,
-  makeJsonFetcher, detectDeployment, loadReport, buildReport, trayInfo, formatRemaining, demoReport,
+  DEFAULTS, REFRESH_CHOICES, JiraError, cleanBaseUrl, normalizeSettings, weekOf, dateKey, parseDateKey, isoWeek, monthGrid,
+  nextUpdateText, fieldText, sprintText, commentText, makeJsonFetcher, detectDeployment, connect, loadEntriesRange,
+  loadReport, buildReport, buildMonth, trayInfo, formatRemaining, exportCsv, demoEntries, demoReport, demoMonth,
+  isAdminOf, userKey, jqlString, loadGroupMembers, loadOverdue, overdueItems, buildTeamWeek, demoTeamWeek, demoOverdue, DEMO_TEAM,
 };

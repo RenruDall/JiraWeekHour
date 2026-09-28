@@ -6,11 +6,21 @@ Jira stores every worklog, but it has no personal day or week view. Jira Week Ho
 
 ![Week view](docs/screenshot.png)
 
+| Calendar | Log | PDF report |
+|---|---|---|
+| ![Calendar](docs/calendar.png) | ![Log](docs/log.png) | ![PDF report](docs/report.png) |
+
 ## Features
 
 - **Tray icon** with the hours still missing today; a green check once you reach your target.
 - **Week view**: every day with its sprints, tickets and hours, plus weekly totals per sprint.
-- **Automatic updates** at fixed times (default 12:00 and 16:00) with a reminder if hours are missing. "Update now" works any time.
+- **Browse back** through earlier weeks with the ‹ › arrows; "This week" jumps back.
+- **Calendar**: a month view with every day coloured by logged hours (target reached / partly / nothing). Click a week to open it.
+- **Log**: every single worklog entry with start time, duration, ticket, sprint and your comment - the protocol as it is stored in Jira.
+- **Export** the week as a **PDF report** with bar charts (per day stacked by sprint, per sprint, per ticket) plus the full worklog, or as **CSV** for Excel.
+- **Overdue tasks**: your unresolved tasks whose due date is more than *N* days ago (you choose *N*).
+- **Team dashboard for admins**: members of an admin group in Jira see everyone in a team group at a glance - hours per person and day, what is missing, each person's sprints and tickets, and the team's overdue tasks. Everybody else only sees their own hours.
+- **Automatic updates** every 15 min to 4 h (your choice, or off), plus reminder times (default 12:00 and 16:00) that notify you if hours are missing. "Update now" works any time.
 - **Works with Jira Cloud and Jira Data Center.** Paste your Jira address; the app detects which one it is.
 - **Start with Windows**, and closing the window keeps it running in the tray.
 - **Read-only.** It never changes anything in Jira and only reads your own worklogs.
@@ -44,8 +54,31 @@ Some single sign-on providers (Google in particular) refuse sign-in from embedde
 | Setting | Default | Notes |
 |---|---|---|
 | Daily target | 8 h | Monday to Friday |
-| Automatic updates | 12:00, 16:00 | Any list of times, e.g. `10:00, 12:00, 16:00` |
+| Update every | 1 hour | Off, 15 min, 30 min, 1 h, 2 h or 4 h - quiet background update |
+| Reminder times | 12:00, 16:00 | Update + notification if hours are missing, e.g. `10:00, 12:00, 16:00` |
+| Task counts as overdue after | 3 days | Unresolved tasks more than this many days past their due date |
+| Admin group | *(empty = off)* | Jira group whose members see the team dashboard |
+| Team group | *(empty)* | Jira group shown on the team dashboard |
 | Group hours by | Sprint | Also issue type, project, component, labels or any custom field (`customfield_12345`) |
+
+### Team dashboard
+
+The team dashboard stays off until an **admin group** and a **team group** are set. Admin status is checked by Jira: the app asks Jira which groups you belong to, so only people IT has put into the admin group get the *Team* tab.
+
+IT can fix the address and the groups centrally so users cannot change them, for example with Intune:
+
+```
+HKEY_LOCAL_MACHINE\SOFTWARE\Policies\JiraWeekHours
+  BaseUrl     REG_SZ   https://jira.your-company.com
+  AdminGroup  REG_SZ   it-team-leads
+  TeamGroup   REG_SZ   it-italy
+```
+
+What the dashboard can show is still limited by **Jira's own permissions**: an admin sees colleagues' worklogs only on projects they may browse in Jira. The app adds no extra access.
+
+> **Before switching the team dashboard on**, check it with HR, the works council or your data-protection officer. Showing employees' logged working time to a lead is a monitoring measure in many countries (for example Art. 4 Statuto dei lavoratori in Italy, § 96 ArbVG in Austria).
+
+![Team dashboard](docs/team.png)
 
 **Disconnect Jira** in Settings signs out, removes the saved token and lets you connect another Jira.
 
@@ -90,12 +123,13 @@ git push origin v1.0.0
 ## Project layout
 
 ```
-src/main.js        tray icon, window, sign-in window, scheduled updates
-src/core.js        Jira access (Cloud + Data Center), week report, demo data
+src/main.js        tray icon, window, sign-in window, scheduled updates, export
+src/core.js        Jira access (Cloud + Data Center), week/month/team reports, overdue tasks, CSV, demo data
 src/squirrel.js    installer events (shortcuts on install, cleanup on uninstall)
 src/autostart.js   "Start with Windows"
+src/policy.js      settings fixed by IT in the registry
 src/preload.js     safe bridge between the window and the app
-src/ui/            window (HTML, CSS, JS) and icons
+src/ui/            window (HTML, CSS, JS), PDF report page and icons
 test/              tests with fake Jira servers
 forge.config.js    Electron Forge: Setup.exe
 ```
