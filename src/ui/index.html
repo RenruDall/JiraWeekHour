@@ -43,6 +43,7 @@
         <button type="button" class="btn btn-small" id="nav-today">This week</button>
       </nav>
 
+      <section id="workday" class="card workday" hidden aria-label="Today's work clock"></section>
       <div id="days" class="card days" aria-live="polite"></div>
       <div id="calendar" class="card calendar" hidden></div>
       <div id="log" class="card log" hidden></div>
@@ -181,7 +182,9 @@
         <span>Team group <small class="muted" id="lock-team"></small></span>
         <input id="f-team-group" type="text" spellcheck="false" placeholder="e.g. it-italy">
       </label>
-      <small class="muted">Members of the admin group see everyone in the team group. Everybody else sees only their own hours. Both are Jira group names.</small>
+      <label class="check"><input id="f-jira-admins" type="checkbox"> Jira administrators are admins too <small class="muted" id="lock-jira-admins"></small></label>
+      <small class="muted">Members of the admin group see everyone in the team group. Everybody else sees only their own hours. Both are Jira group names, exactly as in Jira.</small>
+      <div class="access-diag" id="access-diag" hidden></div>
     </fieldset>
 
     <label class="check" id="autostart-row"><input id="f-autostart" type="checkbox"> Start with Windows</label>
@@ -193,6 +196,8 @@
       <button type="submit" class="btn btn-primary">Save</button>
       <button type="button" class="btn" id="cancel-settings">Cancel</button>
     </div>
+
+    <div class="version muted" id="app-version"></div>
 
     <div class="danger-zone">
       <button type="button" class="link-btn danger" id="disconnect">Disconnect Jira</button>

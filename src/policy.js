@@ -4,11 +4,12 @@
 //     AdminGroup  (REG_SZ)  Jira group whose members see the team dashboard
 //     TeamGroup   (REG_SZ)  Jira group shown on the team dashboard
 //     BaseUrl     (REG_SZ)  Jira address
+//     JiraAdminsAreAdmins (REG_SZ) "1" = Jira administrators also see the team dashboard
 // HKLM can only be written by administrators, so a normal user cannot make themselves admin here.
 const { execFileSync } = require('child_process');
 
 const POLICY_KEY = 'HKLM\\SOFTWARE\\Policies\\JiraWeekHours';
-const VALUES = { AdminGroup: 'adminGroup', TeamGroup: 'teamGroup', BaseUrl: 'baseUrl' };
+const VALUES = { AdminGroup: 'adminGroup', TeamGroup: 'teamGroup', BaseUrl: 'baseUrl', JiraAdminsAreAdmins: 'jiraAdminsAreAdmins' };
 
 // Parses the output of "reg query <key>"
 function parseRegQuery(output) {

@@ -13,6 +13,7 @@ const DEFAULTS = Object.freeze({
   overdueDays: 3,             // a task counts as overdue when its due date is more than this many days ago
   adminGroup: '',             // members of this Jira group see the team dashboard (empty = off)
   teamGroup: '',              // the Jira group whose members the team dashboard shows
+  jiraAdminsAreAdmins: false, // also treat Jira administrators (global permission) as dashboard admins
   demo: false,
 });
 
@@ -87,7 +88,9 @@ function normalizeSettings(raw) {
   const adminGroup = String(s.adminGroup || '').trim().slice(0, 255);
   const teamGroup = String(s.teamGroup || '').trim().slice(0, 255);
 
-  return { baseUrl, auth, email, targetHours, categoryField, refreshTimes, autoRefreshMinutes, overdueDays, adminGroup, teamGroup, demo: !!s.demo };
+  const jiraAdminsAreAdmins = s.jiraAdminsAreAdmins === true || s.jiraAdminsAreAdmins === 'true' || s.jiraAdminsAreAdmins === '1' || s.jiraAdminsAreAdmins === 1;
+
+  return { baseUrl, auth, email, targetHours, categoryField, refreshTimes, autoRefreshMinutes, overdueDays, adminGroup, teamGroup, jiraAdminsAreAdmins, demo: !!s.demo };
 }
 
 // ------------------------------------------------------------------- dates
@@ -266,13 +269,24 @@ async function connect(fetchJson, settings) {
   const api = deployment === 'cloud' ? 3 : 2;
   const me = await fetchJson(`/rest/api/${api}/myself?expand=groups`);
   const category = await resolveCategoryField(fetchJson, api, settings.categoryField);
-  const groups = (me.groups && Array.isArray(me.groups.items) ? me.groups.items : []).map((g) => String(g.name || '').toLowerCase()).filter(Boolean);
-  return { deployment, api, me, category, groups, displayName: me.displayName || me.name || 'you' };
+  const groupNames = (me.groups && Array.isArray(me.groups.items) ? me.groups.items : []).map((g) => String(g.name || '')).filter(Boolean).sort((a, b) => a.localeCompare(b));
+  // Jira administrator (global "Administer Jira" permission), whatever the admin group is called
+  let jiraAdmin = false;
+  try {
+    const perms = await fetchJson(`/rest/api/${api}/mypermissions?permissions=ADMINISTER`);
+    jiraAdmin = !!(perms && perms.permissions && perms.permissions.ADMINISTER && perms.permissions.ADMINISTER.havePermission);
+  } catch (err) {
+    if (err.kind === 'network') throw err;
+  }
+  return { deployment, api, me, category, groupNames, groups: groupNames.map((g) => g.toLowerCase()), jiraAdmin, displayName: me.displayName || me.name || 'you' };
 }
 
-// Admin = member of the configured Jira group (checked by Jira, not by the app)
-function isAdminOf(ctx, adminGroup) {
-  return !!(adminGroup && ctx && Array.isArray(ctx.groups) && ctx.groups.includes(String(adminGroup).toLowerCase()));
+// Admin = member of the configured Jira group, or (if allowed in settings) a Jira administrator.
+// Both are checked by Jira, not by the app.
+function isAdminOf(ctx, adminGroup, allowJiraAdmins = false) {
+  if (!ctx) return false;
+  if (allowJiraAdmins && ctx.jiraAdmin) return true;
+  return !!(adminGroup && Array.isArray(ctx.groups) && ctx.groups.includes(String(adminGroup).trim().toLowerCase()));
 }
 
 const userKey = (u) => (u ? String(u.accountId || u.key || u.name || '') : '');
@@ -567,6 +581,97 @@ function buildTeamWeek(entries, members, settings, now, opts = {}) {
   };
 }
 
+// ---------------------------------------------------------------- work clock
+const minutesOf = (d) => d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60;
+const hhmm = (min) => `${pad(Math.floor(Math.round(min) / 60) % 24)}:${pad(Math.round(min) % 60)}`;
+
+// When did today's work start? The earliest sign of the PC being in use today:
+// Windows start (if it was today), the app starting, or the first unlock / wake-up today.
+// A start the user corrected by hand always wins.
+function pickClockStart({ now, bootTime, appStart, firstActive, manual }) {
+  const todayKey = dateKey(now);
+  const isToday = (d) => d instanceof Date && !Number.isNaN(d.getTime()) && dateKey(d) === todayKey && d <= now;
+  if (isToday(manual)) return manual;
+  const candidates = [bootTime, appStart, firstActive].filter(isToday);
+  return candidates.length ? new Date(Math.min(...candidates.map((d) => d.getTime()))) : null;
+}
+
+// Today's timeline from the clock start until now: booked in Jira (green), not booked (amber),
+// pauses (screen locked / PC asleep, shown but not subtracted from the working time).
+function buildWorkday({ start, now, pauses = [], entries = [] }) {
+  const todayKey = dateKey(now);
+  const nowMin = minutesOf(now);
+  const today = entries.filter((e) => e.day === todayKey);
+  const bookedHours = round2(today.reduce((s, e) => s + e.hours, 0));
+  if (!start) return { running: false, bookedHours };
+
+  const startMin = dateKey(start) === todayKey ? minutesOf(start) : 0;
+  const booked = today
+    .filter((e) => /^\d\d:\d\d$/.test(e.time || ''))
+    .map((e) => {
+      const from = Number(e.time.slice(0, 2)) * 60 + Number(e.time.slice(3, 5));
+      return { from, to: Math.min(24 * 60, from + e.hours * 60), key: e.key, summary: e.summary };
+    })
+    .sort((a, b) => a.from - b.from);
+  const pauseIv = pauses
+    .map((p) => {
+      const from = p.from ? (dateKey(p.from) === todayKey ? minutesOf(p.from) : 0) : null;
+      const to = p.to ? (dateKey(p.to) === todayKey ? minutesOf(p.to) : null) : nowMin;
+      return from === null || to === null || to <= from ? null : { from: Math.max(from, startMin), to: Math.min(to, nowMin), kind: p.kind || 'lock', ongoing: !p.to };
+    })
+    .filter((p) => p && p.to > p.from);
+
+  const rangeFrom = Math.min(startMin, ...booked.map((b) => b.from));
+  const rangeTo = Math.max(nowMin, ...booked.map((b) => b.to));
+  const points = new Set([rangeFrom, rangeTo, startMin, nowMin]);
+  for (const iv of [...booked, ...pauseIv]) { points.add(iv.from); points.add(iv.to); }
+  const sorted = [...points].filter((x) => x >= rangeFrom && x <= rangeTo).sort((a, b) => a - b);
+
+  const segments = [];
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const a = sorted[i];
+    const b = sorted[i + 1];
+    if (b - a < 0.01) continue;
+    const mid = (a + b) / 2;
+    const bk = booked.find((x) => x.from <= mid && x.to > mid);
+    let seg;
+    if (bk) seg = { kind: 'booked', key: bk.key, summary: bk.summary };
+    else if (mid < startMin || mid > nowMin) continue; // outside the workday, nothing booked
+    else if (pauseIv.some((p) => p.from <= mid && p.to > mid)) seg = { kind: 'pause' };
+    else seg = { kind: 'open' };
+    const last = segments[segments.length - 1];
+    if (last && last.kind === seg.kind && last.key === seg.key && Math.abs(last.toMin - a) < 0.01) last.toMin = b;
+    else segments.push({ ...seg, fromMin: a, toMin: b });
+  }
+  for (const sg of segments) {
+    sg.from = hhmm(sg.fromMin);
+    sg.to = hhmm(sg.toMin);
+    sg.minutes = Math.round(sg.toMin - sg.fromMin);
+  }
+
+  const elapsedHours = round2(Math.max(0, nowMin - startMin) / 60);
+  const pauseMinutes = Math.round(pauseIv.reduce((s, p) => s + (p.to - p.from), 0));
+  return {
+    running: true,
+    start: hhmm(startMin),
+    now: hhmm(nowMin),
+    elapsedHours,
+    bookedHours,
+    openHours: round2(Math.max(0, elapsedHours - bookedHours)),
+    pauseMinutes,
+    rangeFrom,
+    rangeTo,
+    segments,
+    gaps: segments.filter((sg) => sg.kind === 'open' && sg.minutes >= 5).map(({ from, to, minutes }) => ({ from, to, minutes })),
+    pauses: pauseIv.map((p) => ({ from: hhmm(p.from), to: p.ongoing ? null : hhmm(p.to), minutes: Math.round(p.to - p.from), kind: p.kind })),
+  };
+}
+
+const formatMinutes = (min) => {
+  const m = Math.max(0, Math.round(min));
+  return m >= 60 ? `${Math.floor(m / 60)}h ${pad(m % 60)}m` : `${m}m`;
+};
+
 // ---------------------------------------------------------------- tray info
 function formatRemaining(hours) {
   const up = Math.ceil(hours * 10 - 1e-9) / 10; // round up: 0.25h left shows 0.3
@@ -648,8 +753,13 @@ function demoEntries(from, to, now, bumps) {
     const key = dateKey(d);
     if (key > todayKey) break;
     if (key === todayKey) {
-      add(key, 'IT-104', 2, '08:30');
-      add(key, 'IT-117', 3, '10:45');
+      // today's sample bookings never reach past the current time
+      const nowMin = now.getHours() * 60 + now.getMinutes();
+      for (const [ticket, hours, time] of [['IT-104', 2, '08:30'], ['IT-117', 3, '10:45']]) {
+        const startMin = Number(time.slice(0, 2)) * 60 + Number(time.slice(3, 5));
+        const upToNow = Math.floor(((nowMin - startMin) / 60) * 4) / 4;
+        if (upToNow > 0) add(key, ticket, Math.min(hours, upToNow), time);
+      }
       if (bumps > 0) add(key, 'IT-123', Math.min(bumps * 0.5, 6), '14:00');
       continue;
     }
@@ -730,5 +840,5 @@ module.exports = {
   DEFAULTS, REFRESH_CHOICES, JiraError, cleanBaseUrl, normalizeSettings, weekOf, dateKey, parseDateKey, isoWeek, monthGrid,
   nextUpdateText, fieldText, sprintText, commentText, makeJsonFetcher, detectDeployment, connect, loadEntriesRange,
   loadReport, buildReport, buildMonth, trayInfo, formatRemaining, exportCsv, demoEntries, demoReport, demoMonth,
-  isAdminOf, userKey, jqlString, loadGroupMembers, loadOverdue, overdueItems, buildTeamWeek, demoTeamWeek, demoOverdue, DEMO_TEAM,
+  pickClockStart, buildWorkday, formatMinutes, isAdminOf, userKey, jqlString, loadGroupMembers, loadOverdue, overdueItems, buildTeamWeek, demoTeamWeek, demoOverdue, DEMO_TEAM,
 };

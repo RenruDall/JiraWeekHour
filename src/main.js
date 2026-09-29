@@ -2,6 +2,7 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, session, safeStorage, powerMonitor, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const core = require('./core');
 const { handleSquirrelEvent } = require('./squirrel');
 const { getAutostart, setAutostart } = require('./autostart');
@@ -9,6 +10,9 @@ const { readPolicy } = require('./policy');
 
 const APP_NAME = 'Jira Week Hours';
 const START_HIDDEN = process.argv.includes('--hidden');
+const FIRST_RUN = process.argv.includes('--squirrel-firstrun'); // first start right after installing
+const APP_STARTED = new Date();
+const BOOT_TIME = new Date(Date.now() - os.uptime() * 1000);
 const argValue = (name) => (process.argv.find((a) => a.startsWith(`--${name}=`)) || '').slice(name.length + 3);
 const CAPTURE = argValue('capture');           // dev: screenshot the window and quit
 const CAPTURE_VIEW = argValue('capture-view'); // dev: open this view first (week, calendar, log)
@@ -93,6 +97,107 @@ function makeFetcher(settings) {
   return core.makeJsonFetcher((url, init) => ses.fetch(url, init), settings.baseUrl, headers);
 }
 
+// --------------------------------------------------------------- work clock
+// Kept only on this PC (%APPDATA%\Jira Week Hours\clock.json); never sent to Jira.
+const clockFile = () => path.join(dataDir(), 'clock.json');
+let clock = null;
+let lastClockDay = null;
+
+function loadClock() {
+  if (clock) return clock;
+  try { clock = JSON.parse(fs.readFileSync(clockFile(), 'utf8')); } catch { clock = {}; }
+  if (!clock || typeof clock !== 'object' || !clock.days) clock = { days: {} };
+  return clock;
+}
+
+function saveClock() {
+  const days = Object.keys(clock.days).sort();
+  for (const key of days.slice(0, Math.max(0, days.length - 60))) delete clock.days[key]; // keep 60 days
+  try {
+    fs.mkdirSync(dataDir(), { recursive: true });
+    fs.writeFileSync(clockFile(), JSON.stringify(clock, null, 1));
+  } catch { /* not critical */ }
+}
+
+function clockDay(date = new Date()) {
+  const key = core.dateKey(date);
+  const days = loadClock().days;
+  if (!days[key]) days[key] = { appStart: null, firstActive: null, manual: null, pauses: [] };
+  return days[key];
+}
+
+function markAppStart() {
+  const day = clockDay();
+  if (!day.appStart || new Date(day.appStart) > APP_STARTED) day.appStart = APP_STARTED.toISOString();
+  saveClock();
+}
+
+function markActive(now = new Date()) {
+  const day = clockDay(now);
+  if (!day.firstActive) { day.firstActive = now.toISOString(); saveClock(); }
+}
+
+function openPause(kind) {
+  const now = new Date();
+  const day = clockDay(now);
+  const open = day.pauses.find((p) => !p.to);
+  if (!open) { day.pauses.push({ from: now.toISOString(), to: null, kind }); saveClock(); }
+}
+
+function closePause() {
+  const now = new Date();
+  const days = loadClock().days;
+  for (const key of Object.keys(days)) {
+    for (const p of days[key].pauses) {
+      if (p.to) continue;
+      // a pause that began on an earlier day ends at that day's midnight
+      p.to = key === core.dateKey(now) ? now.toISOString() : new Date(core.parseDateKey(key).getTime() + 86400000 - 1000).toISOString();
+    }
+  }
+  markActive(now);
+  saveClock();
+}
+
+function computeWorkday() {
+  const settings = loadSettings();
+  const now = new Date();
+  const todayKey = core.dateKey(now);
+  const entries = state.report && state.report.isCurrentWeek ? state.report.log.filter((e) => e.day === todayKey) : [];
+  if (settings.demo) {
+    const at = (h, m) => new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
+    const start = at(7, 50) < now ? at(7, 50) : now;
+    const pauses = at(12, 45) < now ? [{ from: at(12, 5), to: at(12, 45), kind: 'lock' }] : [];
+    return { ...core.buildWorkday({ start, now, pauses, entries }), manual: false, demo: true };
+  }
+  const day = clockDay(now);
+  const manual = day.manual ? new Date(day.manual) : null;
+  const start = core.pickClockStart({
+    now,
+    bootTime: BOOT_TIME,
+    appStart: day.appStart ? new Date(day.appStart) : null,
+    firstActive: day.firstActive ? new Date(day.firstActive) : null,
+    manual,
+  });
+  const pauses = day.pauses.map((p) => ({ from: new Date(p.from), to: p.to ? new Date(p.to) : null, kind: p.kind }));
+  return { ...core.buildWorkday({ start, now, pauses, entries }), manual: !!manual, bootToday: core.dateKey(BOOT_TIME) === todayKey };
+}
+
+function setClockStart(value) {
+  const now = new Date();
+  const day = clockDay(now);
+  if (value === null || value === '') {
+    day.manual = null;
+  } else {
+    const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(value).trim());
+    if (!m) throw new Error('Use a time like 07:30.');
+    const when = new Date(now.getFullYear(), now.getMonth(), now.getDate(), Number(m[1]), Number(m[2]));
+    if (when > now) throw new Error('The start cannot be in the future.');
+    day.manual = when.toISOString();
+  }
+  saveClock();
+  pushState();
+}
+
 // ------------------------------------------------------------------- update
 async function refresh(reason) {
   if (state.updating) return;
@@ -171,7 +276,7 @@ async function loadMonth(year, month) {
 
 function isAdmin(settings) {
   if (settings.demo) return true; // the demo shows the team view with sample colleagues
-  return core.isAdminOf(state.ctx, settings.adminGroup);
+  return core.isAdminOf(state.ctx, settings.adminGroup, settings.jiraAdminsAreAdmins);
 }
 
 async function loadTeamWeek(weekStart) {
@@ -180,7 +285,7 @@ async function loadTeamWeek(weekStart) {
   if (settings.demo) return core.demoTeamWeek(new Date(), demoBumps, settings, weekDate);
   const fetchJson = makeFetcher(settings);
   const ctx = await jiraContext(fetchJson, settings);
-  if (!core.isAdminOf(ctx, settings.adminGroup)) throw new Error('Only members of the admin group can see the team dashboard.');
+  if (!core.isAdminOf(ctx, settings.adminGroup, settings.jiraAdminsAreAdmins)) throw new Error('Only members of the admin group can see the team dashboard.');
   if (!settings.teamGroup) throw new Error('No team group set. Add it in Settings.');
   if (!state.members || state.members.group !== settings.teamGroup) {
     state.members = { group: settings.teamGroup, list: await core.loadGroupMembers(fetchJson, ctx, settings.teamGroup) };
@@ -198,7 +303,7 @@ async function loadOverdue(scope) {
   const fetchJson = makeFetcher(settings);
   const ctx = await jiraContext(fetchJson, settings);
   if (team) {
-    if (!core.isAdminOf(ctx, settings.adminGroup)) throw new Error('Only members of the admin group can see the team\'s overdue tasks.');
+    if (!core.isAdminOf(ctx, settings.adminGroup, settings.jiraAdminsAreAdmins)) throw new Error('Only members of the admin group can see the team\'s overdue tasks.');
     if (!settings.teamGroup) throw new Error('No team group set. Add it in Settings.');
     return core.loadOverdue(fetchJson, ctx, settings, now, { group: settings.teamGroup });
   }
@@ -230,6 +335,10 @@ function pushState() {
     nextUpdate: scheduleText(settings),
     startView: CAPTURE_VIEW || null,
     isAdmin: isAdmin(settings),
+    workday: computeWorkday(),
+    version: app.getVersion(),
+    // shown in Settings so a mismatching group name is easy to spot
+    access: state.ctx ? { groups: state.ctx.groupNames || [], jiraAdmin: !!state.ctx.jiraAdmin, inAdminGroup: core.isAdminOf(state.ctx, settings.adminGroup) } : null,
     policy: Object.keys(state.policy),
     settingsWarning: state.settingsWarning,
     tray: core.trayInfo(state.report, state.error),
@@ -273,6 +382,14 @@ function scheduleText(settings) {
 }
 
 function tick() {
+  const todayKey = core.dateKey(new Date());
+  if (lastClockDay && lastClockDay !== todayKey) {
+    // the PC was in use across midnight: today's work starts now, unless the screen is locked
+    const yesterday = loadClock().days[lastClockDay];
+    const locked = yesterday && yesterday.pauses.some((p) => !p.to);
+    if (!locked) markActive();
+  }
+  lastClockDay = todayKey;
   const settings = loadSettings();
   const slot = dueSlot(settings);
   if (slot) refresh(`scheduled ${slot}`);
@@ -450,6 +567,13 @@ function registerIpc() {
   };
   ipcMain.handle('load-week', (_e, weekStart) => safely(loadWeek)(String(weekStart || '')));
   ipcMain.handle('load-month', (_e, year, month) => safely(loadMonth)(Number(year), Number(month)));
+  ipcMain.handle('set-clock-start', (_e, value) => safely(setClockStart)(value));
+  ipcMain.on('open-jira', (_e, key) => {
+    const settings = loadSettings();
+    if (!settings.baseUrl || settings.demo) return;
+    const ticket = typeof key === 'string' && /^[A-Z][A-Z0-9_]+-\d+$/.test(key) ? `/browse/${key}` : '/';
+    shell.openExternal(`${settings.baseUrl}${ticket}`);
+  });
   ipcMain.handle('load-team', (_e, weekStart) => safely(loadTeamWeek)(String(weekStart || '')));
   ipcMain.handle('load-overdue', (_e, scope) => safely(loadOverdue)(scope === 'team' ? 'team' : 'me'));
   ipcMain.handle('export', async (_e, kind, weekStart) => {
@@ -516,6 +640,14 @@ function registerIpc() {
 // -------------------------------------------------------------------- start
 function start() {
   state.policy = readPolicy();
+  markAppStart();
+  lastClockDay = core.dateKey(new Date());
+  // right after installation: start with Windows, so the clock starts when the PC starts
+  if (FIRST_RUN) { try { setAutostart(true); } catch { /* user can switch it on in the tray menu */ } }
+  powerMonitor.on('lock-screen', () => { openPause('lock'); pushState(); });
+  powerMonitor.on('suspend', () => { openPause('sleep'); pushState(); });
+  powerMonitor.on('unlock-screen', () => { closePause(); pushState(); });
+  powerMonitor.on('resume', () => { closePause(); });
   registerIpc();
   createMainWindow();
 

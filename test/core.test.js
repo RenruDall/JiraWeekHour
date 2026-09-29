@@ -267,6 +267,10 @@ function fakeTeamJira({ cloud, listGroups = true }) {
       return json({ ...lead, groups: url.searchParams.get('expand') === 'groups' ? { size: 2, items: [{ name: 'IT-Leads' }, { name: 'jira-users' }] } : undefined });
     }
     if (p === `/rest/api/${api}/field`) return json([SPRINT_FIELD]);
+    if (p === `/rest/api/${api}/mypermissions`) {
+      assert.strictEqual(url.searchParams.get('permissions'), 'ADMINISTER');
+      return json({ permissions: { ADMINISTER: { key: 'ADMINISTER', havePermission: true } } });
+    }
     if (p === `/rest/api/${api}/group/member`) {
       if (!listGroups) return json({ errorMessages: ['no permission'] }, 403);
       assert.strictEqual(url.searchParams.get('groupname'), 'it-italy');
@@ -312,6 +316,10 @@ for (const cloud of [false, true]) {
       assert.ok(core.isAdminOf(ctx, settings.adminGroup), 'group names compare case-insensitively');
       assert.ok(!core.isAdminOf(ctx, 'it-italy'));
       assert.ok(!core.isAdminOf(ctx, ''), 'no admin group configured = nobody is admin');
+      assert.ok(!core.isAdminOf(ctx, 'Administrator'), 'a wrong group name does not match');
+      assert.ok(core.isAdminOf(ctx, 'Administrator', true), 'Jira administrators count when allowed');
+      assert.ok(core.isAdminOf(ctx, '', true));
+      assert.deepStrictEqual(ctx.groupNames, ['IT-Leads', 'jira-users'], 'original spelling kept for the settings hint');
 
       const members = await core.loadGroupMembers(fetchJson, ctx, settings.teamGroup);
       assert.deepStrictEqual(members.map((m) => m.displayName), ['Anna Berger', 'Tom Huber'], 'inactive users are left out');
@@ -370,4 +378,57 @@ test('reads IT policy from the registry output', () => {
   const out = '\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\JiraWeekHours\r\n    AdminGroup    REG_SZ    it-leads\r\n    TeamGroup    REG_SZ    IT Italy\r\n    Other    REG_DWORD    0x1\r\n    BaseUrl    REG_SZ    \r\n';
   assert.deepStrictEqual(parseRegQuery(out), { adminGroup: 'it-leads', teamGroup: 'IT Italy' });
   assert.deepStrictEqual(parseRegQuery(''), {});
+  assert.deepStrictEqual(parseRegQuery('    JiraAdminsAreAdmins    REG_SZ    1\r\n'), { jiraAdminsAreAdmins: '1' });
+  assert.strictEqual(core.normalizeSettings({ jiraAdminsAreAdmins: '1' }).jiraAdminsAreAdmins, true);
+  assert.strictEqual(core.normalizeSettings({}).jiraAdminsAreAdmins, false);
+});
+
+// ---------------------------------------------------------------- work clock
+test('clock starts at the earliest sign of PC use today', () => {
+  const now = new Date(2026, 8, 29, 14, 0);
+  const at = (h, m, day = 29) => new Date(2026, 8, day, h, m);
+  assert.deepStrictEqual(core.pickClockStart({ now, bootTime: at(7, 40), appStart: at(7, 42) }), at(7, 40));
+  // PC booted days ago (fast startup / sleep): the app start or first unlock today counts
+  assert.deepStrictEqual(core.pickClockStart({ now, bootTime: at(9, 0, 25), appStart: at(8, 5), firstActive: at(7, 58) }), at(7, 58));
+  // a start corrected by hand wins
+  assert.deepStrictEqual(core.pickClockStart({ now, bootTime: at(7, 40), manual: at(7, 15) }), at(7, 15));
+  // nothing from today yet
+  assert.strictEqual(core.pickClockStart({ now, bootTime: at(9, 0, 28), appStart: at(9, 0, 28) }), null);
+});
+
+test('workday timeline shows booked, not booked and pauses', () => {
+  const now = new Date(2026, 8, 29, 14, 0);
+  const entries = [
+    { day: '2026-09-29', time: '08:30', hours: 2, key: 'IT-1', summary: 'A' },
+    { day: '2026-09-29', time: '10:30', hours: 1.5, key: 'IT-2', summary: 'B' },
+    { day: '2026-09-28', time: '09:00', hours: 8, key: 'IT-9', summary: 'yesterday' },
+  ];
+  const pauses = [{ from: new Date(2026, 8, 29, 12, 0), to: new Date(2026, 8, 29, 12, 30), kind: 'lock' }];
+  const w = core.buildWorkday({ start: new Date(2026, 8, 29, 8, 0), now, pauses, entries });
+  assert.strictEqual(w.start, '08:00');
+  assert.strictEqual(w.elapsedHours, 6, 'pauses are not subtracted');
+  assert.strictEqual(w.bookedHours, 3.5);
+  assert.strictEqual(w.openHours, 2.5);
+  assert.strictEqual(w.pauseMinutes, 30);
+  assert.deepStrictEqual(w.segments.map((s) => `${s.kind}:${s.from}-${s.to}`), [
+    'open:08:00-08:30', 'booked:08:30-10:30', 'booked:10:30-12:00', 'pause:12:00-12:30', 'open:12:30-14:00',
+  ]);
+  assert.deepStrictEqual(w.gaps, [{ from: '08:00', to: '08:30', minutes: 30 }, { from: '12:30', to: '14:00', minutes: 90 }]);
+  assert.deepStrictEqual(w.pauses, [{ from: '12:00', to: '12:30', minutes: 30, kind: 'lock' }]);
+});
+
+test('workday: ongoing pause, bookings before the clock and without a time', () => {
+  const now = new Date(2026, 8, 29, 10, 0);
+  const entries = [
+    { day: '2026-09-29', time: '07:00', hours: 1, key: 'IT-1' }, // booked before the PC started
+    { day: '2026-09-29', time: '', hours: 0.5, key: 'IT-2' },     // no start time: counts, no block
+  ];
+  const w = core.buildWorkday({ start: new Date(2026, 8, 29, 8, 0), now, pauses: [{ from: new Date(2026, 8, 29, 9, 30), kind: 'sleep' }], entries });
+  assert.strictEqual(w.bookedHours, 1.5);
+  assert.strictEqual(w.openHours, 0.5);
+  assert.deepStrictEqual(w.segments.map((s) => `${s.kind}:${s.from}-${s.to}`), ['booked:07:00-08:00', 'open:08:00-09:30', 'pause:09:30-10:00']);
+  assert.deepStrictEqual(w.pauses, [{ from: '09:30', to: null, minutes: 30, kind: 'sleep' }]);
+  assert.deepStrictEqual(core.buildWorkday({ start: null, now, entries }), { running: false, bookedHours: 1.5 });
+  assert.strictEqual(core.formatMinutes(130), '2h 10m');
+  assert.strictEqual(core.formatMinutes(45), '45m');
 });

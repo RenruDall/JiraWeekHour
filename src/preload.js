@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld('jwh', {
   loadMonth: (year, month) => ipcRenderer.invoke('load-month', year, month),
   loadTeam: (weekStart) => ipcRenderer.invoke('load-team', weekStart),
   loadOverdue: (scope) => ipcRenderer.invoke('load-overdue', scope),
+  setClockStart: (value) => ipcRenderer.invoke('set-clock-start', value),
+  openJira: (key) => ipcRenderer.send('open-jira', key),
   exportReport: (kind, weekStart) => ipcRenderer.invoke('export', kind, weekStart),
   setTrayIcon: (dataUrl, tooltip) => ipcRenderer.send('tray-icon', dataUrl, tooltip),
   rendered: () => ipcRenderer.send('rendered'),

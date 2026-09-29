@@ -28,6 +28,7 @@ const view = {
   teamOverdue: null,   // { items } or { error }
   expanded: null,      // member row opened in the team grid
   overdue: null,       // my overdue tasks: { items } or { error }
+  editingStart: false, // the "Edit start" field is open
 };
 
 const pad2 = (n) => String(n).padStart(2, '0');
@@ -80,7 +81,9 @@ function render(s) {
   $('last').textContent = s.updating ? 'Updating…' : (s.lastUpdate ? `Last update ${time(s.lastUpdate)} (${s.lastReason})` : '');
   $('next').textContent = s.nextUpdate;
 
-  drawTrayIcon(s.tray);
+  const w = s.workday;
+  const tip = w && w.running && !s.error ? `${s.tray.tooltip} \u00b7 at work ${fmtMin(w.elapsedHours * 60)}, ${fmtMin(w.openHours * 60)} not booked` : s.tray.tooltip;
+  drawTrayIcon({ ...s.tray, tooltip: tip });
 
   // After every finished update, reload an older week or the calendar too
   if (!s.updating && s.lastUpdate && s.lastUpdate !== view.lastSeenUpdate) {
@@ -127,6 +130,7 @@ function renderMain() {
   const isCal = view.tab === 'calendar';
   for (const tab of document.querySelectorAll('.tab')) tab.setAttribute('aria-selected', String(tab.dataset.view === view.tab));
   $('days').hidden = view.tab !== 'week';
+  renderWorkday();
   $('calendar').hidden = !isCal;
   $('log').hidden = view.tab !== 'log';
   $('team').hidden = view.tab !== 'team';
@@ -360,6 +364,96 @@ function renderLog(r) {
   }).join('');
 }
 
+const fmtMin = (min) => {
+  const m = Math.max(0, Math.round(min));
+  return m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m}m`;
+};
+const PAUSE_TEXT = { lock: 'screen locked', sleep: 'PC asleep' };
+
+// Today's work clock: time since the PC started, what is booked in Jira and what is still open
+function renderWorkday() {
+  const box = $('workday');
+  const w = current && current.workday;
+  const show = !!(w && current.report && view.tab === 'week' && viewingCurrentWeek());
+  box.hidden = !show;
+  if (!show || view.editingStart) return;
+
+  if (!w.running) {
+    box.innerHTML = `<div class="wd-head"><span class="card-title">Work clock</span><span class="since">Starts with your first activity today.</span></div>
+      <div class="wd-actions"><button type="button" class="btn btn-small" id="wd-edit">Set start time</button></div>`;
+    $('wd-edit').addEventListener('click', openStartEditor);
+    return;
+  }
+  const span = Math.max(1, w.rangeTo - w.rangeFrom);
+  const pos = (min) => `${((min - w.rangeFrom) / span) * 100}%`;
+  const width = (a, b) => `${((b - a) / span) * 100}%`;
+  const segs = w.segments.map((sg) => {
+    const what = sg.kind === 'booked' ? `${sg.key}${sg.summary ? ` ${sg.summary}` : ''}` : (sg.kind === 'pause' ? 'Pause' : 'Not booked');
+    return `<div class="wd-seg ${sg.kind}" style="left:${pos(sg.fromMin)};width:${width(sg.fromMin, sg.toMin)}" title="${esc(`${sg.from}–${sg.to} ${what} (${fmtMin(sg.minutes)})`)}"></div>`;
+  }).join('');
+  const nowMin = Number(w.now.slice(0, 2)) * 60 + Number(w.now.slice(3, 5));
+  // whole-hour ticks, at most ~10 labels
+  const firstHour = Math.ceil(w.rangeFrom / 60);
+  const lastHour = Math.floor(w.rangeTo / 60);
+  const step = Math.max(1, Math.ceil((lastHour - firstHour + 1) / 10));
+  let ticks = '';
+  for (let h = firstHour; h <= lastHour; h += step) ticks += `<span style="left:${pos(h * 60)}">${String(h).padStart(2, '0')}</span>`;
+
+  const gaps = w.gaps.length
+    ? `<div><strong>Not booked yet:</strong> ${w.gaps.map((g) => `<span class="chip open">${esc(g.from)}–${esc(g.to)} · ${fmtMin(g.minutes)}</span>`).join('')}</div>`
+    : '<div><strong>Everything since the start is booked.</strong></div>';
+  const pauses = w.pauses.length
+    ? `<div>Pauses (counted as work time): ${w.pauses.map((p) => `<span class="chip pause">${esc(p.from)}–${esc(p.to || 'now')} · ${esc(PAUSE_TEXT[p.kind] || 'pause')}</span>`).join('')}</div>`
+    : '';
+  const openZero = w.openHours <= 0.01;
+
+  box.innerHTML = `
+    <div class="wd-head">
+      <span class="card-title">Work clock</span>
+      <span class="since">At work since <strong>${esc(w.start)}</strong>${w.manual ? ' (set by you)' : ''}</span>
+    </div>
+    <div class="wd-stats">
+      <div class="wd-stat"><div class="label">At work</div><div class="value">${fmtMin(w.elapsedHours * 60)}</div></div>
+      <div class="wd-stat booked"><div class="label">Booked in Jira</div><div class="value">${fmtMin(w.bookedHours * 60)}</div></div>
+      <div class="wd-stat open ${openZero ? 'zero' : ''}"><div class="label">Not booked</div><div class="value">${openZero ? 'All booked' : fmtMin(w.openHours * 60)}</div></div>
+    </div>
+    <div>
+      <div class="wd-track" role="img" aria-label="${esc(`Today from ${w.start} to ${w.now}: ${fmtMin(w.bookedHours * 60)} booked, ${fmtMin(w.openHours * 60)} not booked`)}">${segs}<div class="wd-now" style="left:${pos(nowMin)}" title="Now ${esc(w.now)}"></div></div>
+      <div class="wd-axis">${ticks}</div>
+    </div>
+    <div class="cal-legend"><span><i style="background: var(--green)"></i>Booked</span><span><i style="background: var(--amber)"></i>Not booked</span><span><i style="background: repeating-linear-gradient(45deg, #c9c6bf 0 3px, #e7e5e0 3px 7px)"></i>Pause</span></div>
+    <div class="wd-lists">${gaps}${pauses}</div>
+    <div class="wd-actions">
+      ${w.demo ? '' : '<button type="button" class="btn btn-small" id="wd-jira">Book in Jira</button>'}
+      <button type="button" class="link-btn" id="wd-edit">Edit start</button>
+      ${w.manual ? '<button type="button" class="link-btn" id="wd-reset">Use automatic start</button>' : ''}
+    </div>`;
+  const jira = $('wd-jira');
+  if (jira) jira.addEventListener('click', () => jwh.openJira());
+  $('wd-edit').addEventListener('click', openStartEditor);
+  const reset = $('wd-reset');
+  if (reset) reset.addEventListener('click', () => jwh.setClockStart(null));
+}
+
+function openStartEditor() {
+  const w = current.workday || {};
+  view.editingStart = true;
+  const box = $('workday');
+  box.innerHTML = `<form class="wd-edit" id="wd-form">
+      <label for="wd-time">Today's work started at</label>
+      <input id="wd-time" type="time" value="${esc(w.start || '')}" required>
+      <button type="submit" class="btn btn-small btn-primary">Save</button>
+      <button type="button" class="btn btn-small" id="wd-cancel">Cancel</button>
+    </form><p class="wd-note" id="wd-error" role="alert"></p>`;
+  $('wd-time').focus();
+  $('wd-cancel').addEventListener('click', () => { view.editingStart = false; renderWorkday(); });
+  $('wd-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const res = await jwh.setClockStart($('wd-time').value);
+    if (res.ok) { view.editingStart = false; renderWorkday(); } else { $('wd-error').textContent = res.message; }
+  });
+}
+
 async function loadOverdueCard() {
   const res = await jwh.loadOverdue('me');
   view.overdue = res.ok ? { items: res.data } : { error: res.message };
@@ -559,6 +653,11 @@ function openSettings() {
   $('f-url').disabled = locked.has('baseUrl');
   $('lock-admin').textContent = locked.has('adminGroup') ? '(set by your IT)' : '';
   $('lock-team').textContent = locked.has('teamGroup') ? '(set by your IT)' : '';
+  $('f-jira-admins').checked = !!s.jiraAdminsAreAdmins;
+  $('f-jira-admins').disabled = locked.has('jiraAdminsAreAdmins');
+  $('lock-jira-admins').textContent = locked.has('jiraAdminsAreAdmins') ? '(set by your IT)' : '';
+  $('app-version').textContent = current.version ? `Jira Week Hours ${current.version}` : '';
+  renderAccessDiag();
   const known = ['sprint', 'issuetype', 'project', 'components', 'labels'];
   $('f-category').value = known.includes(s.categoryField) ? s.categoryField : '__custom';
   $('f-custom').value = known.includes(s.categoryField) ? '' : s.categoryField;
@@ -570,6 +669,22 @@ function openSettings() {
   $('drawer').hidden = false;
   $('drawer-backdrop').hidden = false;
   $('f-url').focus();
+}
+
+// Shows which Jira groups the user is in and whether that makes them a dashboard admin
+function renderAccessDiag() {
+  const box = $('access-diag');
+  const a = current && current.access;
+  const s = current && current.settings;
+  if (!a || !s || s.demo) { box.hidden = true; return; }
+  const groups = a.groups.length ? a.groups.map((g) => `<code>${esc(g)}</code>`).join(' ') : '<em>Jira did not report any groups</em>';
+  let status;
+  if (current.isAdmin) status = '<span class="yes">You see the Team tab.</span>';
+  else if (!s.adminGroup && !s.jiraAdminsAreAdmins) status = '<span class="no">No admin group set, so nobody sees the Team tab.</span>';
+  else if (s.adminGroup && !a.inAdminGroup) status = `<span class="no">You are not in \u201c${esc(s.adminGroup)}\u201d.</span> Pick one of your groups above, spelled exactly like that.`;
+  else status = '<span class="no">You are not a Jira administrator.</span>';
+  box.innerHTML = `Your Jira groups: ${groups}<br>Jira administrator: ${a.jiraAdmin ? 'yes' : 'no'}<br>${status}${current.isAdmin && !s.teamGroup ? '<br><span class="no">Set a team group to fill the dashboard.</span>' : ''}`;
+  box.hidden = false;
 }
 
 function closeSettings() {
@@ -597,6 +712,7 @@ async function saveSettings(e) {
       overdueDays: Number($('f-overdue').value),
       adminGroup: $('f-admin-group').value.trim(),
       teamGroup: $('f-team-group').value.trim(),
+      jiraAdminsAreAdmins: $('f-jira-admins').checked,
       categoryField: category,
       demo: $('f-demo').checked,
     },

@@ -14,6 +14,7 @@ Jira stores every worklog, but it has no personal day or week view. Jira Week Ho
 
 - **Tray icon** with the hours still missing today; a green check once you reach your target.
 - **Week view**: every day with its sprints, tickets and hours, plus weekly totals per sprint.
+- **Work clock**: starts when your PC starts and keeps ticking. It compares the time at work with what you booked in Jira and shows the gaps still to book (booked = green, not booked = amber, pauses = grey).
 - **Browse back** through earlier weeks with the ‹ › arrows; "This week" jumps back.
 - **Calendar**: a month view with every day coloured by logged hours (target reached / partly / nothing). Click a week to open it.
 - **Log**: every single worklog entry with start time, duration, ticket, sprint and your comment - the protocol as it is stored in Jira.
@@ -57,13 +58,27 @@ Some single sign-on providers (Google in particular) refuse sign-in from embedde
 | Update every | 1 hour | Off, 15 min, 30 min, 1 h, 2 h or 4 h - quiet background update |
 | Reminder times | 12:00, 16:00 | Update + notification if hours are missing, e.g. `10:00, 12:00, 16:00` |
 | Task counts as overdue after | 3 days | Unresolved tasks more than this many days past their due date |
-| Admin group | *(empty = off)* | Jira group whose members see the team dashboard |
+| Admin group | *(empty = off)* | Jira group whose members see the team dashboard, spelled exactly as in Jira (Settings lists your groups) |
+| Jira administrators are admins too | off | Anyone with Jira's global *Administer Jira* permission also sees the team dashboard |
 | Team group | *(empty)* | Jira group shown on the team dashboard |
 | Group hours by | Sprint | Also issue type, project, component, labels or any custom field (`customfield_12345`) |
 
+### Work clock
+
+The clock starts at the first sign of PC use today: Windows starting (if that was today), the app starting, or the first unlock / wake-up. The installer switches on *Start with Windows*, so the app is running from the moment you log in. If the start is wrong (for example you started working before switching on the PC), use **Edit start**.
+
+- **At work** = now minus the start. Pauses (screen locked, PC asleep) are listed but **not subtracted**.
+- **Booked in Jira** = today's worklogs. **Not booked** = at work minus booked.
+- The timeline shows which periods are not booked yet; book them in Jira as usual (**Book in Jira** opens it), then *Update now*.
+- The clock is stored only on your PC (`%APPDATA%\Jira Week Hours\clock.json`, last 60 days). It is never sent to Jira and never appears on the team dashboard.
+
+![Work clock](docs/workclock.png)
+
 ### Team dashboard
 
-The team dashboard stays off until an **admin group** and a **team group** are set. Admin status is checked by Jira: the app asks Jira which groups you belong to, so only people IT has put into the admin group get the *Team* tab.
+The team dashboard stays off until an **admin group** (or *Jira administrators are admins too*) and a **team group** are set. Admin status is checked by Jira: the app asks Jira which groups you belong to and whether you are a Jira administrator.
+
+**No Team tab?** Open Settings: under *Team dashboard* it lists your Jira groups exactly as Jira spells them and says why you are or aren't an admin. Jira's built-in admin group is usually `jira-administrators` (Data Center) or `administrators` / `site-admins` (Cloud), not "Administrator".
 
 IT can fix the address and the groups centrally so users cannot change them, for example with Intune:
 
@@ -72,6 +87,7 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Policies\JiraWeekHours
   BaseUrl     REG_SZ   https://jira.your-company.com
   AdminGroup  REG_SZ   it-team-leads
   TeamGroup   REG_SZ   it-italy
+  JiraAdminsAreAdmins  REG_SZ   1
 ```
 
 What the dashboard can show is still limited by **Jira's own permissions**: an admin sees colleagues' worklogs only on projects they may browse in Jira. The app adds no extra access.
