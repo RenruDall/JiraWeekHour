@@ -248,7 +248,7 @@ test('demo data covers past weeks and months the same way every time', () => {
 });
 
 // ---------------------------------------------------------------- team dashboard
-function fakeTeamJira({ cloud, listGroups = true }) {
+function fakeTeamJira({ cloud, listGroups = true, role = 'none' }) {
   const u = (id, name) => (cloud ? { accountId: `acc-${id}`, displayName: name } : { name: id, key: `KEY-${id}`, displayName: name });
   const lead = u('lead', 'Lena Lead');
   const anna = u('anna', 'Anna Berger');
@@ -267,9 +267,26 @@ function fakeTeamJira({ cloud, listGroups = true }) {
       return json({ ...lead, groups: url.searchParams.get('expand') === 'groups' ? { size: 2, items: [{ name: 'IT-Leads' }, { name: 'jira-users' }] } : undefined });
     }
     if (p === `/rest/api/${api}/field`) return json([SPRINT_FIELD]);
-    if (p === `/rest/api/${api}/mypermissions`) {
-      assert.strictEqual(url.searchParams.get('permissions'), 'ADMINISTER');
-      return json({ permissions: { ADMINISTER: { key: 'ADMINISTER', havePermission: true } } });
+    // Project settings > People: lead and the Administrators role
+    const projects = [{ key: 'OPS', lead: anna }, { key: 'NET', lead: role === 'lead' ? lead : tom }, { key: 'SEC', lead: tom }];
+    if (!cloud && p === '/rest/api/2/project') return json(projects);
+    if (cloud && p === '/rest/api/3/project/search') return json({ values: projects, isLast: true });
+    const roleList = p.match(new RegExp(`^/rest/api/${api}/project/([A-Z]+)/role$`));
+    if (roleList) {
+      if (roleList[1] === 'SEC') return json({ errorMessages: ['no permission'] }, 403); // one project we may not read
+      return json({ Administrators: `http://jira/rest/api/${api}/project/${roleList[1]}/role/10002`, Developers: `http://jira/rest/api/${api}/project/${roleList[1]}/role/10001` });
+    }
+    const roleOne = p.match(new RegExp(`^/rest/api/${api}/project/([A-Z]+)/role/10002$`));
+    if (roleOne) {
+      const actors = [{ type: 'atlassian-user-role-actor', name: 'anna', actorUser: cloud ? { accountId: 'acc-anna' } : undefined }];
+      if (role === 'projadmin-user' && roleOne[1] === 'OPS') actors.push({ type: 'atlassian-user-role-actor', name: 'lead', actorUser: cloud ? { accountId: 'acc-lead' } : undefined });
+      if (role === 'projadmin-group' && roleOne[1] === 'NET') actors.push({ type: 'atlassian-group-role-actor', name: 'IT-Leads', actorGroup: { name: 'IT-Leads' } });
+      return json({ name: 'Administrators', actors });
+    }
+    if (p === `/rest/api/${api}/user/search`) {
+      const q = (url.searchParams.get(cloud ? 'query' : 'username') || '').toLowerCase();
+      return json([anna, tom, outsider, { ...u('bot', 'Build Bot'), accountType: cloud ? 'app' : undefined, active: cloud ? true : false }]
+        .filter((x) => x.displayName.toLowerCase().includes(q)));
     }
     if (p === `/rest/api/${api}/group/member`) {
       if (!listGroups) return json({ errorMessages: ['no permission'] }, 403);
@@ -279,7 +296,7 @@ function fakeTeamJira({ cloud, listGroups = true }) {
     const searchPath = cloud ? '/rest/api/3/search/jql' : '/rest/api/2/search';
     if (p === searchPath && jql.includes('duedate')) {
       assert.ok(jql.includes('startOfDay("-3d")'), jql);
-      const team = jql.includes('membersOf("it-italy")');
+      const team = jql.includes('membersOf("it-italy")') || jql.startsWith('assignee in (');
       const issues = [
         { key: 'IT-76', fields: { summary: 'Patch firmware', duedate: '2026-09-10', assignee: tom, status: { name: 'Waiting' }, priority: { name: 'High' } } },
         { key: 'IT-88', fields: { summary: 'Renew certificate', duedate: '2026-09-20', assignee: lead, status: { name: 'Open' }, priority: { name: 'Medium' } } },
@@ -289,7 +306,7 @@ function fakeTeamJira({ cloud, listGroups = true }) {
       return json(cloud ? { issues: team ? issues : [issues[1]], isLast: true } : { total: 3, issues: team ? issues : [issues[1]] });
     }
     if (p === searchPath) {
-      assert.ok(jql.startsWith('worklogAuthor in membersOf("it-italy")'), jql);
+      assert.ok(jql.startsWith('worklogAuthor in membersOf("it-italy")') || jql.startsWith('worklogAuthor in ("'), jql);
       const issues = [{ key: 'IT-1', fields: { summary: 'Shared ticket', customfield_10020: [{ name: 'Sprint 5' }] } }];
       return json(cloud ? { issues, isLast: true } : { total: 1, issues });
     }
@@ -315,10 +332,9 @@ for (const cloud of [false, true]) {
       const ctx = await core.connect(fetchJson, settings);
       assert.ok(core.isAdminOf(ctx, settings.adminGroup), 'group names compare case-insensitively');
       assert.ok(!core.isAdminOf(ctx, 'it-italy'));
-      assert.ok(!core.isAdminOf(ctx, ''), 'no admin group configured = nobody is admin');
+      assert.ok(!core.isAdminOf(ctx, ''), 'not lead, not project admin, no admin group = no Team tab');
+      assert.deepStrictEqual(core.adminReasons(ctx, 'it-leads'), ['member of it-leads']);
       assert.ok(!core.isAdminOf(ctx, 'Administrator'), 'a wrong group name does not match');
-      assert.ok(core.isAdminOf(ctx, 'Administrator', true), 'Jira administrators count when allowed');
-      assert.ok(core.isAdminOf(ctx, '', true));
       assert.deepStrictEqual(ctx.groupNames, ['IT-Leads', 'jira-users'], 'original spelling kept for the settings hint');
 
       const members = await core.loadGroupMembers(fetchJson, ctx, settings.teamGroup);
@@ -378,9 +394,7 @@ test('reads IT policy from the registry output', () => {
   const out = '\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\JiraWeekHours\r\n    AdminGroup    REG_SZ    it-leads\r\n    TeamGroup    REG_SZ    IT Italy\r\n    Other    REG_DWORD    0x1\r\n    BaseUrl    REG_SZ    \r\n';
   assert.deepStrictEqual(parseRegQuery(out), { adminGroup: 'it-leads', teamGroup: 'IT Italy' });
   assert.deepStrictEqual(parseRegQuery(''), {});
-  assert.deepStrictEqual(parseRegQuery('    JiraAdminsAreAdmins    REG_SZ    1\r\n'), { jiraAdminsAreAdmins: '1' });
-  assert.strictEqual(core.normalizeSettings({ jiraAdminsAreAdmins: '1' }).jiraAdminsAreAdmins, true);
-  assert.strictEqual(core.normalizeSettings({}).jiraAdminsAreAdmins, false);
+  assert.deepStrictEqual(parseRegQuery('    JiraAdminsAreAdmins    REG_SZ    1\r\n'), {}, 'retired value is ignored');
 });
 
 // ---------------------------------------------------------------- work clock
@@ -396,72 +410,106 @@ test('clock starts at the earliest sign of PC use today', () => {
   assert.strictEqual(core.pickClockStart({ now, bootTime: at(9, 0, 28), appStart: at(9, 0, 28) }), null);
 });
 
-test('workday timeline shows booked, not booked and pauses', () => {
-  const now = new Date(2026, 8, 29, 14, 0);
-  const entries = [
-    { day: '2026-09-29', time: '08:30', hours: 2, key: 'IT-1', summary: 'A' },
-    { day: '2026-09-29', time: '10:30', hours: 1.5, key: 'IT-2', summary: 'B' },
-    { day: '2026-09-28', time: '09:00', hours: 8, key: 'IT-9', summary: 'yesterday' },
-  ];
-  const pauses = [{ from: new Date(2026, 8, 29, 12, 0), to: new Date(2026, 8, 29, 12, 30), kind: 'lock' }];
-  const w = core.buildWorkday({ start: new Date(2026, 8, 29, 8, 0), now, pauses, entries });
-  assert.strictEqual(w.start, '08:00');
-  assert.strictEqual(w.elapsedHours, 6, 'pauses are not subtracted');
-  assert.strictEqual(w.bookedHours, 3.5);
-  assert.strictEqual(w.openHours, 2.5);
-  assert.strictEqual(w.pauseMinutes, 30);
-  assert.deepStrictEqual(w.segments.map((s) => `${s.kind}:${s.from}-${s.to}`), [
-    'open:08:00-08:30', 'booked:08:30-10:30', 'booked:10:30-12:00', 'pause:12:00-12:30', 'open:12:30-14:00',
-  ]);
-  assert.deepStrictEqual(w.gaps, [{ from: '08:00', to: '08:30', minutes: 30 }, { from: '12:30', to: '14:00', minutes: 90 }]);
-  assert.deepStrictEqual(w.pauses, [{ from: '12:00', to: '12:30', minutes: 30, kind: 'lock' }]);
-});
-
-test('workday: ongoing pause, bookings before the clock and without a time', () => {
-  const now = new Date(2026, 8, 29, 10, 0);
-  const entries = [
-    { day: '2026-09-29', time: '07:00', hours: 1, key: 'IT-1' }, // booked before the PC started
-    { day: '2026-09-29', time: '', hours: 0.5, key: 'IT-2' },     // no start time: counts, no block
-  ];
-  const w = core.buildWorkday({ start: new Date(2026, 8, 29, 8, 0), now, pauses: [{ from: new Date(2026, 8, 29, 9, 30), kind: 'sleep' }], entries });
-  assert.strictEqual(w.bookedHours, 1.5);
-  assert.strictEqual(w.openHours, 0.5);
-  assert.deepStrictEqual(w.segments.map((s) => `${s.kind}:${s.from}-${s.to}`), ['booked:07:00-08:00', 'open:08:00-09:30', 'pause:09:30-10:00']);
-  assert.deepStrictEqual(w.pauses, [{ from: '09:30', to: null, minutes: 30, kind: 'sleep' }]);
-  assert.deepStrictEqual(core.buildWorkday({ start: null, now, entries }), { running: false, bookedHours: 1.5 });
-  assert.strictEqual(core.formatMinutes(130), '2h 10m');
-  assert.strictEqual(core.formatMinutes(45), '45m');
-});
-
-test('Pause button: breaks are subtracted, locked screen is not', () => {
-  const now = new Date(2026, 8, 29, 14, 0);
+test('workday bar: booked hours fill from the start, lunch is grey and not counted', () => {
   const at = (h, m) => new Date(2026, 8, 29, h, m);
-  const w = core.buildWorkday({
-    start: at(8, 0),
-    now,
-    pauses: [
-      { from: at(12, 0), to: at(12, 45), kind: 'manual' },
-      { from: at(10, 0), to: at(10, 15), kind: 'lock' },
-      { from: at(13, 50), kind: 'manual' }, // on a break right now
-    ],
-    entries: [{ day: '2026-09-29', time: '08:00', hours: 2, key: 'IT-1' }],
-  });
-  assert.strictEqual(w.breakMinutes, 55);
-  assert.strictEqual(w.elapsedHours, round2((6 * 60 - 55) / 60), '6h minus 55 min of breaks');
-  assert.strictEqual(w.pauseMinutes, 15);
-  assert.strictEqual(w.onBreak, '13:50');
-  assert.strictEqual(w.openHours, round2(w.elapsedHours - 2));
-  assert.deepStrictEqual(w.breaks, [{ from: '12:00', to: '12:45', minutes: 45 }, { from: '13:50', to: null, minutes: 10 }]);
-  assert.deepStrictEqual(w.pauses, [{ from: '10:00', to: '10:15', minutes: 15, kind: 'lock' }]);
-  assert.ok(w.segments.some((sg) => sg.kind === 'break' && sg.from === '12:00' && sg.to === '12:45'));
-  assert.ok(w.segments.some((sg) => sg.kind === 'pause' && sg.from === '10:00'));
-  assert.ok(!w.gaps.some((g) => g.from === '12:00'), 'a break is not a gap to book');
-});
-function round2(n) { return Math.round(n * 100) / 100; }
+  const lunch = { start: '12:00', end: '13:00' };
+  // 14:00, started 08:00, lunch 12-13: 5h at work; 3.5h booked (entered whenever)
+  const w = core.buildWorkday({ start: at(8, 0), now: at(14, 0), lunch, bookedHours: 3.5 });
+  assert.strictEqual(w.elapsedHours, 5);
+  assert.strictEqual(w.openHours, 1.5);
+  assert.deepStrictEqual(w.segments.map((sg) => `${sg.kind}:${sg.from}-${sg.to}`), ['booked:08:00-11:30', 'open:11:30-12:00', 'lunch:12:00-13:00', 'open:13:00-14:00']);
+  assert.deepStrictEqual(w.lunch, { start: '12:00', end: '13:00', changed: false, takenMinutes: 60 });
 
-test('a break pressed this very minute already counts as "on a break"', () => {
-  const now = new Date(2026, 8, 29, 12, 30, 10);
-  const w = core.buildWorkday({ start: new Date(2026, 8, 29, 8, 0), now, pauses: [{ from: new Date(2026, 8, 29, 12, 30, 10), kind: 'manual' }], entries: [] });
-  assert.strictEqual(w.onBreak, '12:30');
-  assert.deepStrictEqual(w.breaks, [{ from: '12:30', to: null, minutes: 0 }]);
+  // booked hours jump over the lunch break
+  const w2 = core.buildWorkday({ start: at(8, 0), now: at(14, 0), lunch, bookedHours: 5 });
+  assert.deepStrictEqual(w2.segments.map((sg) => `${sg.kind}:${sg.from}-${sg.to}`), ['booked:08:00-12:00', 'lunch:12:00-13:00', 'booked:13:00-14:00']);
+  assert.strictEqual(w2.openHours, 0);
+
+  // more booked than worked so far (e.g. booked in advance): the bar runs past now
+  const w3 = core.buildWorkday({ start: at(8, 0), now: at(10, 0), lunch, bookedHours: 5 });
+  assert.strictEqual(w3.aheadHours, 3);
+  assert.strictEqual(w3.segments[w3.segments.length - 1].to, '14:00');
+
+  // before lunch; no lunch configured
+  const w4 = core.buildWorkday({ start: at(8, 0), now: at(10, 0), lunch: null, bookedHours: 0 });
+  assert.deepStrictEqual(w4.segments.map((sg) => sg.kind), ['open']);
+  assert.strictEqual(w4.elapsedHours, 2);
+  assert.deepStrictEqual(core.buildWorkday({ start: null, now: at(10, 0), bookedHours: 1.5 }), { running: false, bookedHours: 1.5 });
+
+  // with a daily target the bar spans the whole day: 08:00 + 8h + 1h lunch = 17:00
+  const w5 = core.buildWorkday({ start: at(8, 0), now: at(10, 0), lunch, bookedHours: 1, targetHours: 8 });
+  assert.strictEqual(w5.targetEnd, '17:00');
+  assert.strictEqual(w5.rangeTo, 17 * 60);
+  assert.deepStrictEqual(w5.segments.map((sg) => `${sg.kind}:${sg.from}-${sg.to}`), ['booked:08:00-09:00', 'open:09:00-10:00', 'lunch:12:00-13:00'], 'lunch ahead is already shown grey');
+  assert.strictEqual(core.formatMinutes(130), '2h 10m');
 });
+
+test('lunch break settings: standard, one-day changes, validation', () => {
+  const s = core.normalizeSettings({ lunchOverrides: [
+    { date: '2026-09-29', start: '12:30', end: '13:00' },
+    { date: '2026-09-30', start: '', end: '' },
+    { date: '2026-09-29', start: '11:45', end: '12:15' }, // later change for the same day wins
+  ] });
+  assert.deepStrictEqual(core.lunchFor(s, '2026-09-28'), { start: '12:00', end: '13:00', changed: false });
+  assert.deepStrictEqual(core.lunchFor(s, '2026-09-29'), { start: '11:45', end: '12:15', changed: true });
+  assert.strictEqual(core.lunchFor(s, '2026-09-30'), null, 'no lunch that day');
+  assert.strictEqual(core.lunchFor(core.normalizeSettings({ lunchStart: '', lunchEnd: '' }), '2026-09-28'), null);
+  assert.throws(() => core.normalizeSettings({ lunchStart: '13:00', lunchEnd: '12:00' }), /end after/);
+  assert.throws(() => core.normalizeSettings({ lunchStart: '12:00', lunchEnd: '' }), /start and an end/);
+  assert.throws(() => core.normalizeSettings({ lunchOverrides: [{ date: '2026-09-29', start: '9', end: '10' }] }), /2026-09-29/);
+});
+
+for (const cloud of [false, true]) {
+  test(`Team tab for project leads and project administrators (${cloud ? 'Cloud' : 'Data Center'})`, async () => {
+    const cases = [
+      ['none', false, []],
+      ['lead', true, ['project lead of NET']],
+      ['projadmin-user', true, ['in the Administrators role of OPS']],
+      ['projadmin-group', true, ['in the Administrators role of NET']],
+    ];
+    for (const [role, expected, reasons] of cases) {
+      const jira = await fakeTeamJira({ cloud, role });
+      try {
+        const fetchJson = core.makeJsonFetcher(fetch, jira.baseUrl);
+        const ctx = await core.connect(fetchJson, core.normalizeSettings({ baseUrl: jira.baseUrl }));
+        assert.strictEqual(core.isAdminOf(ctx, ''), expected, role);
+        assert.deepStrictEqual(core.adminReasons(ctx, ''), reasons, role);
+        assert.strictEqual(ctx.roles.projectsChecked, 3);
+        assert.ok(!jira.seen.some((x) => x.includes('mypermissions')), 'no global Jira admin check');
+      } finally {
+        jira.server.close();
+      }
+    }
+  });
+
+  test(`member picker (${cloud ? 'Cloud' : 'Data Center'})`, async () => {
+    const jira = await fakeTeamJira({ cloud, role: 'lead' });
+    try {
+      const settings = core.normalizeSettings({ baseUrl: jira.baseUrl });
+      const fetchJson = core.makeJsonFetcher(fetch, settings.baseUrl);
+      const ctx = await core.connect(fetchJson, settings);
+      assert.ok(core.isAdminOf(ctx, ''));
+
+      // search people, pick two, load only their hours and overdue tasks
+      const found = await core.searchUsers(fetchJson, ctx, 'an');
+      assert.ok(found.some((m) => m.displayName === 'Anna Berger'));
+      assert.ok(!found.some((m) => m.displayName === 'Build Bot'), 'bots / inactive users are left out');
+      assert.deepStrictEqual(await core.searchUsers(fetchJson, ctx, 'a'), [], 'at least 2 letters');
+      const anna = found.find((m) => m.displayName === 'Anna Berger');
+      const tom = (await core.searchUsers(fetchJson, ctx, 'tom'))[0];
+      assert.strictEqual(anna.jql, cloud ? 'acc-anna' : 'anna', 'JQL uses account ID on Cloud, username on Data Center');
+      const picked = core.normalizeSettings({ teamMembers: [anna, tom, anna] }).teamMembers;
+      assert.strictEqual(picked.length, 2, 'no duplicates');
+
+      const week = core.weekOf(FRIDAY);
+      const entries = await core.loadEntriesRange(fetchJson, ctx, week.from, week.to, { selected: picked });
+      const team = core.buildTeamWeek(entries, picked, settings, FRIDAY);
+      assert.deepStrictEqual(team.rows.map((r) => [r.displayName, r.total]), [['Anna Berger', 8], ['Tom Huber', 8]]);
+      assert.ok(jira.seen.some((x) => x.includes(`worklogAuthor in ("${anna.jql}", "${tom.jql}")`)), 'JQL lists exactly the picked people');
+      const overdue = await core.loadOverdue(fetchJson, ctx, settings, FRIDAY, { selected: picked });
+      assert.ok(overdue.some((i) => i.key === 'IT-76'));
+    } finally {
+      jira.server.close();
+    }
+  });
+}

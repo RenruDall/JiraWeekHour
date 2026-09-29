@@ -156,6 +156,29 @@
       <input id="f-overdue" type="number" min="0" max="365" step="1" required>
     </label>
 
+    <fieldset class="field lunch-fields">
+      <legend>Lunch break <small class="muted">(not counted as work time, grey in the bar)</small></legend>
+      <div class="time-pair">
+        <label>From <input id="f-lunch-start" type="time"></label>
+        <label>to <input id="f-lunch-end" type="time"></label>
+      </div>
+      <small class="muted">Your standard lunch break, every workday. Leave both empty for none.</small>
+      <details class="lunch-day">
+        <summary>Change it for one day</summary>
+        <div class="time-pair">
+          <label>Date <input id="f-lday-date" type="date"></label>
+          <label>From <input id="f-lday-start" type="time"></label>
+          <label>to <input id="f-lday-end" type="time"></label>
+        </div>
+        <div class="lday-actions">
+          <button type="button" class="btn btn-small" id="f-lday-add">Apply for this day</button>
+          <small class="muted">No date = today.</small>
+        </div>
+        <p id="lday-error" class="form-error" role="alert" hidden></p>
+      </details>
+      <ul class="lunch-changes" id="lunch-changes"></ul>
+    </fieldset>
+
     <label class="field">
       <span>Group hours by</span>
       <select id="f-category">
@@ -173,18 +196,15 @@
     </label>
 
     <fieldset class="field team-fields">
-      <legend>Team dashboard <small class="muted">(for admins)</small></legend>
+      <legend>Team dashboard <small class="muted">(for project leads and project administrators)</small></legend>
       <label class="field">
-        <span>Admin group <small class="muted" id="lock-admin"></small></span>
+        <span>Extra admin group <small class="muted" id="lock-admin"></small></span>
         <input id="f-admin-group" type="text" spellcheck="false" placeholder="e.g. it-team-leads">
       </label>
       <label class="field">
-        <span>Team group <small class="muted" id="lock-team"></small></span>
+        <span>Team group <small class="muted" id="lock-team">(optional)</small></span>
         <input id="f-team-group" type="text" spellcheck="false" placeholder="e.g. it-italy">
       </label>
-      <label class="check"><input id="f-jira-admins" type="checkbox"> Jira administrators are admins too <small class="muted" id="lock-jira-admins"></small></label>
-      <small class="muted">Members of the admin group see everyone in the team group. Everybody else sees only their own hours. Both are Jira group names, exactly as in Jira.</small>
-      <div class="access-diag" id="access-diag" hidden></div>
     </fieldset>
 
     <label class="check" id="autostart-row"><input id="f-autostart" type="checkbox"> Start with Windows</label>

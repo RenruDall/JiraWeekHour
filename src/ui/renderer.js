@@ -28,7 +28,8 @@ const view = {
   teamOverdue: null,   // { items } or { error }
   expanded: null,      // member row opened in the team grid
   overdue: null,       // my overdue tasks: { items } or { error }
-  editingStart: false, // the "Edit start" field is open
+  editingStart: false, // the "Edit start" or "Change lunch" field is open
+  picker: { open: false, draft: null, group: [], results: [], query: '', note: '' }, // team member list
 };
 
 const pad2 = (n) => String(n).padStart(2, '0');
@@ -66,6 +67,7 @@ function render(s) {
   if (needsSetup && firstSetupFocus) { firstSetupFocus = false; setTimeout(() => $('setup-url').focus(), 0); }
   $('tab-team').hidden = !s.isAdmin;
   if (view.tab === 'team' && !s.isAdmin) view.tab = 'week';
+  if (!$('drawer').hidden) renderLunchChanges();
   if (r) {
     renderToday(r, s);
     renderOverdue();
@@ -83,7 +85,7 @@ function render(s) {
 
   const w = s.workday;
   let tip = s.tray.tooltip;
-  if (w && w.running && !s.error) tip = w.onBreak ? `${tip} \u00b7 on a break since ${w.onBreak}` : `${tip} \u00b7 at work ${fmtMin(w.elapsedHours * 60)}, ${fmtMin(w.openHours * 60)} not booked`;
+  if (w && w.running && !s.error) tip = `${tip} \u00b7 at work ${fmtMin(w.elapsedHours * 60)}, ${fmtMin(w.openHours * 60)} not booked`;
   drawTrayIcon({ ...s.tray, tooltip: tip });
 
   // After every finished update, reload an older week or the calendar too
@@ -97,6 +99,8 @@ function render(s) {
   if (firstRender && r) {
     firstRender = false;
     if (s.startView === 'past') navigate(-1).then(() => jwh.rendered());
+    else if (s.startView === 'members') switchTab('team').then(openPicker).then(() => { pk.draft.set('demo-anna', { id: 'demo-anna', jql: 'aberger', displayName: 'Anna Berger' }); renderPickerList(); jwh.rendered(); });
+    else if (s.startView === 'settings') { openSettings(); document.querySelector('.lunch-day').open = true; document.querySelector('.lunch-fields').scrollIntoView(); jwh.rendered(); }
     else if (s.startView && s.startView !== 'week') switchTab(s.startView).then(() => jwh.rendered());
     else jwh.rendered();
   } else if (firstRender && blocking) {
@@ -369,9 +373,10 @@ const fmtMin = (min) => {
   const m = Math.max(0, Math.round(min));
   return m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m}m`;
 };
-const PAUSE_TEXT = { lock: 'screen locked', sleep: 'PC asleep' };
+const LEGEND = '<div class="cal-legend"><span><i style="background: var(--green)"></i>Booked in Jira</span><span><i style="background: var(--amber)"></i>Not booked yet</span><span><i style="background: var(--lunch)"></i>Lunch break (not counted)</span></div>';
 
-// Today's work clock: time since the PC started, what is booked in Jira and what is still open
+// Today's bar: the whole workday from the start until the target is reached. Booked hours fill it
+// in green from the left - it does not matter when they were entered in Jira. Lunch is grey.
 function renderWorkday() {
   const box = $('workday');
   const w = current && current.workday;
@@ -380,7 +385,7 @@ function renderWorkday() {
   if (!show || view.editingStart) return;
 
   if (!w.running) {
-    box.innerHTML = `<div class="wd-head"><span class="card-title">Work clock</span><span class="since">Starts with your first activity today.</span></div>
+    box.innerHTML = `<div class="wd-head"><span class="card-title">Today</span><span class="since">Starts with your first activity today.</span></div>
       <div class="wd-actions"><button type="button" class="btn btn-small" id="wd-edit">Set start time</button></div>`;
     $('wd-edit').addEventListener('click', openStartEditor);
     return;
@@ -388,11 +393,8 @@ function renderWorkday() {
   const span = Math.max(1, w.rangeTo - w.rangeFrom);
   const pos = (min) => `${((min - w.rangeFrom) / span) * 100}%`;
   const width = (a, b) => `${((b - a) / span) * 100}%`;
-  const segs = w.segments.map((sg) => {
-    const what = sg.kind === 'booked' ? `${sg.key}${sg.summary ? ` ${sg.summary}` : ''}` : ({ pause: 'Pause (counted)', break: 'Break (not counted)' }[sg.kind] || 'Not booked');
-    return `<div class="wd-seg ${sg.kind}" style="left:${pos(sg.fromMin)};width:${width(sg.fromMin, sg.toMin)}" title="${esc(`${sg.from}–${sg.to} ${what} (${fmtMin(sg.minutes)})`)}"></div>`;
-  }).join('');
-  const nowMin = Number(w.now.slice(0, 2)) * 60 + Number(w.now.slice(3, 5));
+  const WHAT = { booked: 'Booked in Jira', open: 'Not booked yet', lunch: 'Lunch break' };
+  const segs = w.segments.map((sg) => `<div class="wd-seg ${sg.kind}" style="left:${pos(sg.fromMin)};width:${width(sg.fromMin, sg.toMin)}" title="${esc(`${WHAT[sg.kind]} ${sg.from}–${sg.to} (${fmtMin(sg.minutes)})`)}"></div>`).join('');
   // whole-hour ticks, at most ~10 labels
   const firstHour = Math.ceil(w.rangeFrom / 60);
   const lastHour = Math.floor(w.rangeTo / 60);
@@ -400,41 +402,40 @@ function renderWorkday() {
   let ticks = '';
   for (let h = firstHour; h <= lastHour; h += step) ticks += `<span style="left:${pos(h * 60)}">${String(h).padStart(2, '0')}</span>`;
 
-  const gaps = w.gaps.length
-    ? `<div><strong>Not booked yet:</strong> ${w.gaps.map((g) => `<span class="chip open">${esc(g.from)}–${esc(g.to)} · ${fmtMin(g.minutes)}</span>`).join('')}</div>`
-    : '<div><strong>Everything since the start is booked.</strong></div>';
-  const pauses = w.pauses.length
-    ? `<div>Pauses (counted as work time): ${w.pauses.map((p) => `<span class="chip pause">${esc(p.from)}–${esc(p.to || 'now')} · ${esc(PAUSE_TEXT[p.kind] || 'pause')}</span>`).join('')}</div>`
-    : '';
-  const breaks = w.breaks && w.breaks.length
-    ? `<div>Breaks (not counted): ${w.breaks.map((b) => `<span class="chip brk">${esc(b.from)}\u2013${esc(b.to || 'now')} \u00b7 ${fmtMin(b.minutes)}</span>`).join('')}</div>`
-    : '';
   const openZero = w.openHours <= 0.01;
+  const third = openZero && w.aheadHours > 0.01
+    ? `<div class="wd-stat open zero"><div class="label">Booked ahead</div><div class="value">+${fmtMin(w.aheadHours * 60)}</div></div>`
+    : `<div class="wd-stat open ${openZero ? 'zero' : ''}"><div class="label">Not booked</div><div class="value">${openZero ? 'All booked' : fmtMin(w.openHours * 60)}</div></div>`;
+  const lunchText = w.lunch
+    ? `Lunch <strong>${esc(w.lunch.start)}–${esc(w.lunch.end)}</strong> ${w.lunch.changed ? '(changed for today)' : '(standard)'}`
+    : 'No lunch break today';
 
   box.innerHTML = `
     <div class="wd-head">
-      <span class="card-title">Work clock</span>
-      <span class="since">At work since <strong>${esc(w.start)}</strong>${w.manual ? ' (set by you)' : ''}${w.onBreak ? ` \u00b7 <strong>on a break since ${esc(w.onBreak)}</strong>` : ''}</span>
+      <span class="card-title">Today</span>
+      <span class="since">At work since <strong>${esc(w.start)}</strong>${w.manual ? ' (set by you)' : ''}${w.targetEnd ? ` · ${esc(current.settings.targetHours)}h reached at about <strong>${esc(w.targetEnd)}</strong>` : ''}</span>
     </div>
     <div class="wd-stats">
       <div class="wd-stat"><div class="label">At work</div><div class="value">${fmtMin(w.elapsedHours * 60)}</div></div>
       <div class="wd-stat booked"><div class="label">Booked in Jira</div><div class="value">${fmtMin(w.bookedHours * 60)}</div></div>
-      <div class="wd-stat open ${openZero ? 'zero' : ''}"><div class="label">Not booked</div><div class="value">${openZero ? 'All booked' : fmtMin(w.openHours * 60)}</div></div>
+      ${third}
     </div>
     <div>
-      <div class="wd-track" role="img" aria-label="${esc(`Today from ${w.start} to ${w.now}: ${fmtMin(w.bookedHours * 60)} booked, ${fmtMin(w.openHours * 60)} not booked`)}">${segs}<div class="wd-now" style="left:${pos(nowMin)}" title="Now ${esc(w.now)}"></div></div>
+      <div class="wd-track" role="img" aria-label="${esc(`Today from ${w.start}: ${fmtMin(w.bookedHours * 60)} booked, ${fmtMin(w.openHours * 60)} not booked`)}">${segs}<div class="wd-now" style="left:${pos(w.nowMin)}" title="Now ${esc(w.now)}"></div></div>
       <div class="wd-axis">${ticks}</div>
     </div>
-    <div class="cal-legend"><span><i style="background: var(--green)"></i>Booked</span><span><i style="background: var(--amber)"></i>Not booked</span><span><i style="background: #b9b6ae"></i>Break</span><span><i style="background: repeating-linear-gradient(45deg, #c9c6bf 0 3px, #e7e5e0 3px 7px)"></i>Locked / asleep</span></div>
-    <div class="wd-lists">${gaps}${breaks}${pauses}</div>
+    ${LEGEND}
     <div class="wd-actions">
       ${w.demo ? '' : '<button type="button" class="btn btn-small" id="wd-jira">Book in Jira</button>'}
+      <span class="wd-lunch">${lunchText}</span>
+      <button type="button" class="link-btn" id="wd-lunch">Change lunch</button>
       <button type="button" class="link-btn" id="wd-edit">Edit start</button>
       ${w.manual ? '<button type="button" class="link-btn" id="wd-reset">Use automatic start</button>' : ''}
     </div>`;
   const jira = $('wd-jira');
   if (jira) jira.addEventListener('click', () => jwh.openJira());
   $('wd-edit').addEventListener('click', openStartEditor);
+  $('wd-lunch').addEventListener('click', openLunchEditor);
   const reset = $('wd-reset');
   if (reset) reset.addEventListener('click', () => jwh.setClockStart(null));
 }
@@ -455,6 +456,33 @@ function openStartEditor() {
     e.preventDefault();
     const res = await jwh.setClockStart($('wd-time').value);
     if (res.ok) { view.editingStart = false; renderWorkday(); } else { $('wd-error').textContent = res.message; }
+  });
+}
+
+// Today's lunch break only; the standard one is in Settings
+function openLunchEditor() {
+  const l = (current.workday && current.workday.lunch) || null;
+  const s = current.settings;
+  view.editingStart = true;
+  const box = $('workday');
+  box.innerHTML = `<form class="wd-edit" id="wd-form">
+      <label for="wd-l-start">Lunch today from</label>
+      <input id="wd-l-start" type="time" value="${esc(l ? l.start : s.lunchStart)}">
+      <label for="wd-l-end">to</label>
+      <input id="wd-l-end" type="time" value="${esc(l ? l.end : s.lunchEnd)}">
+      <label class="check"><input id="wd-l-none" type="checkbox" ${l ? '' : 'checked'}> No lunch today</label>
+      <button type="submit" class="btn btn-small btn-primary">Save</button>
+      ${l && l.changed || (!l && (s.lunchStart || '')) ? '<button type="button" class="btn btn-small" id="wd-l-std">Back to standard</button>' : ''}
+      <button type="button" class="btn btn-small" id="wd-cancel">Cancel</button>
+    </form><p class="wd-note" id="wd-error" role="alert">Only for today. Change the standard lunch break in Settings.</p>`;
+  const done = (res) => { if (res.ok) { view.editingStart = false; renderWorkday(); } else { $('wd-error').textContent = res.message; } };
+  $('wd-cancel').addEventListener('click', () => { view.editingStart = false; renderWorkday(); });
+  const std = $('wd-l-std');
+  if (std) std.addEventListener('click', async () => done(await jwh.setLunchDay({ remove: true })));
+  $('wd-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const none = $('wd-l-none').checked;
+    done(await jwh.setLunchDay({ start: none ? '' : $('wd-l-start').value, end: none ? '' : $('wd-l-end').value }));
   });
 }
 
@@ -488,6 +516,11 @@ function renderOverdue() {
 
 function renderTeam(t) {
   if (!t) return;
+  if (t.needsMembers) {
+    $('team').innerHTML = `<div id="mp"></div><p class="empty">Pick the people you want to see: open <strong>Members</strong> above and tick their names.</p>`;
+    renderPicker();
+    return;
+  }
   const days = current.settings.overdueDays;
   const onTarget = t.totals.onTargetToday;
   const od = view.teamOverdue;
@@ -496,7 +529,7 @@ function renderTeam(t) {
     <div class="team-tile"><div class="label">${onTarget === null ? 'Hours missing' : 'On target today'}</div><div class="value">${onTarget === null ? esc(h1(t.totals.missing)) : `${onTarget} <small>of ${t.totals.members}</small>`}</div></div>
     <div class="team-tile"><div class="label">Overdue tasks</div><div class="value">${od && od.items ? od.items.length : '–'} <small>&gt; ${days} days</small></div></div>
   </div>`;
-  const notice = t.membersKnown ? '' : `<div class="notice">Jira does not allow listing the members of “${esc(current.settings.teamGroup)}” with your account, so only people who logged time in this week are shown.</div>`;
+  const notice = t.membersKnown ? '' : `<div class="notice">Jira does not allow listing the members of \u201c${esc(current.settings.teamGroup)}\u201d with your account, so only people who logged time in this week are shown. Pick people under <strong>Members</strong> instead.</div>`;
   const head = `<div class="tg-head"><div>Name</div>${t.dayLabels.slice(0, 5).map((d) => `<div>${esc(d)}</div>`).join('')}<div>Week</div><div>Missing</div></div>`;
   const groupWord = current.settings.categoryField === 'sprint' ? 'sprint' : 'category';
 
@@ -513,7 +546,7 @@ function renderTeam(t) {
         <span class="tg-num">${esc(h1(r.total))}</span>
         <span class="tg-num ${r.missing > 0 ? 'miss' : 'ok'}">${r.missing > 0 ? esc(h1(r.missing)) : '✓'}</span>
       </button>${detail}`;
-  }).join('') : '<p class="empty">Nobody in this group logged time in this week.</p>';
+  }).join('') : '<p class="empty">Nobody in the list logged time in this week.</p>';
 
   let overdue = '';
   if (od && od.error) overdue = `<p class="empty">Could not load overdue tasks: ${esc(od.error)}</p>`;
@@ -523,7 +556,7 @@ function renderTeam(t) {
     </tbody></table>`;
   } else if (od) overdue = `<p class="empty">No team task is more than ${days} days past its due date.</p>`;
 
-  $('team').innerHTML = `${tiles}${notice}
+  $('team').innerHTML = `<div id="mp"></div>${tiles}${notice}
     <div class="team-grid">${head}${rows}</div>
     <div class="cal-legend"><span><i style="background: var(--green-soft)"></i>${esc(t.target)}h reached</span><span><i style="background: var(--amber-soft)"></i>Partly logged</span><span><i style="background: var(--red-soft)"></i>Nothing logged</span><span>Click a name for details</span></div>
     <h2 class="section-title">Overdue tasks in the team <span class="muted" style="font-weight:400">(more than ${days} days past due)</span></h2>
@@ -534,6 +567,127 @@ function renderTeam(t) {
       renderTeam(view.team);
     });
   }
+  renderPicker();
+}
+
+// --------------------------------------------------------- member picker
+// A dropdown with checkboxes: the admin ticks whose hours the team dashboard shows.
+const pk = view.picker;
+function pickerSelected() { return current.settings.teamMembers || []; }
+
+function renderPicker() {
+  const box = $('mp');
+  if (!box || !current) return;
+  const chosen = pickerSelected();
+  let label = 'Members: none picked';
+  if (chosen.length) label = `Members (${chosen.length})`;
+  else if (current.settings.demo) label = 'Members: sample team';
+  else if (current.settings.teamGroup) label = `Members: group ${current.settings.teamGroup}`;
+  box.className = 'mp';
+  box.innerHTML = `
+    <div class="mp-bar">
+      <button type="button" class="btn btn-small mp-toggle" id="mp-toggle" aria-expanded="${pk.open}" aria-controls="mp-panel">${esc(label)} <span aria-hidden="true">\u25be</span></button>
+      <div class="mp-chips">${chosen.map((m) => `<span class="mp-chip">${esc(m.displayName)}</span>`).join('')}</div>
+    </div>
+    <div class="mp-panel" id="mp-panel" ${pk.open ? '' : 'hidden'}>
+      <input id="mp-search" type="search" placeholder="Search people in Jira (at least 2 letters)" value="${esc(pk.query)}" autocomplete="off" spellcheck="false">
+      <div class="mp-list" id="mp-list" role="group" aria-label="Team members"></div>
+      <div class="mp-foot">
+        <span class="muted" id="mp-count"></span>
+        <button type="button" class="link-btn" id="mp-none">Clear all</button>
+        <button type="button" class="btn btn-small" id="mp-cancel">Cancel</button>
+        <button type="button" class="btn btn-small btn-primary" id="mp-apply">Apply</button>
+      </div>
+    </div>`;
+  $('mp-toggle').addEventListener('click', () => (pk.open ? closePicker() : openPicker()));
+  if (!pk.open) return;
+  renderPickerList();
+  let timer = null;
+  $('mp-search').addEventListener('input', (e) => {
+    pk.query = e.target.value;
+    clearTimeout(timer);
+    timer = setTimeout(searchPicker, 250);
+  });
+  $('mp-none').addEventListener('click', () => { pk.draft.clear(); renderPickerList(); });
+  $('mp-cancel').addEventListener('click', closePicker);
+  $('mp-apply').addEventListener('click', applyPicker);
+  $('mp-search').focus();
+}
+
+async function openPicker() {
+  pk.open = true;
+  pk.draft = new Map(pickerSelected().map((m) => [m.id, m]));
+  pk.results = [];
+  pk.query = '';
+  pk.note = 'Loading\u2026';
+  renderPicker();
+  const res = await jwh.teamCandidates();
+  pk.group = res.ok ? res.data.group : [];
+  pk.note = res.ok ? '' : res.message;
+  if (pk.open) renderPickerList();
+}
+
+function closePicker() {
+  pk.open = false;
+  renderPicker();
+}
+
+async function searchPicker() {
+  const q = pk.query.trim();
+  if (q.length < 2) { pk.results = []; pk.note = ''; renderPickerList(); return; }
+  pk.note = 'Searching\u2026';
+  renderPickerList();
+  const res = await jwh.searchUsers(q);
+  if (q !== pk.query.trim()) return; // a newer search is running
+  pk.results = res.ok ? res.data : [];
+  pk.note = res.ok ? (res.data.length ? '' : `Nobody found for \u201c${q}\u201d.`) : res.message;
+  renderPickerList();
+}
+
+function renderPickerList() {
+  const list = $('mp-list');
+  if (!list) return;
+  const q = pk.query.trim().toLowerCase();
+  const seen = new Set();
+  const rows = [];
+  const add = (m, section) => {
+    if (seen.has(m.id)) return;
+    if (q && section !== 'search' && !m.displayName.toLowerCase().includes(q)) return;
+    seen.add(m.id);
+    rows.push({ m, section });
+  };
+  for (const m of pk.draft.values()) add(m, 'picked');
+  for (const m of pk.results) add(m, 'search');
+  for (const m of pk.group) add(m, 'group');
+  const TITLES = { picked: 'Picked', search: 'Found in Jira', group: current.settings.teamGroup ? `Group ${current.settings.teamGroup}` : 'Suggestions' };
+  let last = null;
+  let html = '';
+  for (const { m, section } of rows) {
+    if (section !== last) { html += `<div class="mp-sec">${esc(TITLES[section])}</div>`; last = section; }
+    html += `<label class="mp-item"><input type="checkbox" data-id="${esc(m.id)}" ${pk.draft.has(m.id) ? 'checked' : ''}> <span>${esc(m.displayName)}</span></label>`;
+  }
+  if (!rows.length && !pk.note) html = '<div class="mp-sec">Type a name to find people in Jira.</div>';
+  if (pk.note) html += `<div class="mp-sec">${esc(pk.note)}</div>`;
+  list.innerHTML = html;
+  const all = new Map(rows.map((r) => [r.m.id, r.m]));
+  for (const cb of list.querySelectorAll('input[type="checkbox"]')) {
+    cb.addEventListener('change', () => {
+      if (cb.checked) pk.draft.set(cb.dataset.id, all.get(cb.dataset.id));
+      else pk.draft.delete(cb.dataset.id);
+      $('mp-count').textContent = `${pk.draft.size} picked`;
+    });
+  }
+  $('mp-count').textContent = `${pk.draft.size} picked`;
+}
+
+async function applyPicker() {
+  const res = await jwh.setTeamMembers([...pk.draft.values()]);
+  if (!res.ok) { pk.note = res.message; renderPickerList(); return; }
+  current.settings.teamMembers = res.data;
+  pk.open = false;
+  view.team = null;
+  view.expanded = null;
+  await loadView();
 }
 
 function renderMonthSide(m) {
@@ -579,17 +733,6 @@ function renderToday(r, s) {
     <div class="since ${s.sinceLast < 0 ? 'down' : ''}">${esc(since)}</div>
     <button class="btn btn-primary btn-block" id="update-btn" type="button" ${s.updating ? 'disabled' : ''}>${s.updating ? 'Updating…' : 'Update now'}</button>`;
   $('update-btn').addEventListener('click', () => jwh.refresh());
-  const w = s.workday;
-  if (w && w.running) {
-    const pause = document.createElement('button');
-    pause.type = 'button';
-    pause.id = 'pause-btn';
-    pause.className = `btn btn-block ${w.onBreak ? 'btn-break' : ''}`;
-    pause.textContent = w.onBreak ? 'Resume work' : 'Pause';
-    pause.title = w.onBreak ? 'End the break; the clock counts again' : 'Start a break (e.g. lunch). Break time is not counted as work time.';
-    pause.addEventListener('click', () => jwh.toggleBreak());
-    $('today').appendChild(pause);
-  }
 }
 
 function renderSide(r, s) {
@@ -667,12 +810,15 @@ function openSettings() {
   $('f-team-group').disabled = locked.has('teamGroup');
   $('f-url').disabled = locked.has('baseUrl');
   $('lock-admin').textContent = locked.has('adminGroup') ? '(set by your IT)' : '';
-  $('lock-team').textContent = locked.has('teamGroup') ? '(set by your IT)' : '';
-  $('f-jira-admins').checked = !!s.jiraAdminsAreAdmins;
-  $('f-jira-admins').disabled = locked.has('jiraAdminsAreAdmins');
-  $('lock-jira-admins').textContent = locked.has('jiraAdminsAreAdmins') ? '(set by your IT)' : '';
+  $('lock-team').textContent = locked.has('teamGroup') ? '(set by your IT)' : '(optional)';
+  $('f-lunch-start').value = s.lunchStart || '';
+  $('f-lunch-end').value = s.lunchEnd || '';
+  $('f-lday-date').value = '';
+  $('f-lday-start').value = s.lunchStart || '12:00';
+  $('f-lday-end').value = s.lunchEnd || '13:00';
+  $('lday-error').hidden = true;
+  renderLunchChanges();
   $('app-version').textContent = current.version ? `Jira Week Hours ${current.version}` : '';
-  renderAccessDiag();
   const known = ['sprint', 'issuetype', 'project', 'components', 'labels'];
   $('f-category').value = known.includes(s.categoryField) ? s.categoryField : '__custom';
   $('f-custom').value = known.includes(s.categoryField) ? '' : s.categoryField;
@@ -686,20 +832,31 @@ function openSettings() {
   $('f-url').focus();
 }
 
-// Shows which Jira groups the user is in and whether that makes them a dashboard admin
-function renderAccessDiag() {
-  const box = $('access-diag');
-  const a = current && current.access;
-  const s = current && current.settings;
-  if (!a || !s || s.demo) { box.hidden = true; return; }
-  const groups = a.groups.length ? a.groups.map((g) => `<code>${esc(g)}</code>`).join(' ') : '<em>Jira did not report any groups</em>';
-  let status;
-  if (current.isAdmin) status = '<span class="yes">You see the Team tab.</span>';
-  else if (!s.adminGroup && !s.jiraAdminsAreAdmins) status = '<span class="no">No admin group set, so nobody sees the Team tab.</span>';
-  else if (s.adminGroup && !a.inAdminGroup) status = `<span class="no">You are not in \u201c${esc(s.adminGroup)}\u201d.</span> Pick one of your groups above, spelled exactly like that.`;
-  else status = '<span class="no">You are not a Jira administrator.</span>';
-  box.innerHTML = `Your Jira groups: ${groups}<br>Jira administrator: ${a.jiraAdmin ? 'yes' : 'no'}<br>${status}${current.isAdmin && !s.teamGroup ? '<br><span class="no">Set a team group to fill the dashboard.</span>' : ''}`;
-  box.hidden = false;
+// One-day lunch changes, newest first; only today and later are listed
+function renderLunchChanges() {
+  const list = $('lunch-changes');
+  if (!list || !current) return;
+  const today = keyOf(new Date());
+  const items = (current.settings.lunchOverrides || []).filter((o) => o.date >= today);
+  list.innerHTML = items.length ? items.map((o) => `<li>
+      <span>${esc(dateOf(o.date).toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: '2-digit' }))}${o.date === today ? ' (today)' : ''}</span>
+      <span>${o.start ? `${esc(o.start)}\u2013${esc(o.end)}` : 'no lunch'}</span>
+      <button type="button" class="link-btn" data-date="${esc(o.date)}" aria-label="Remove the change for ${esc(o.date)}">Remove</button>
+    </li>`).join('') : '<li class="muted">No changes. The standard lunch break applies every workday.</li>';
+  for (const btn of list.querySelectorAll('button[data-date]')) {
+    btn.addEventListener('click', () => jwh.setLunchDay({ date: btn.dataset.date, remove: true }));
+  }
+}
+
+async function addLunchChange() {
+  const res = await jwh.setLunchDay({
+    date: $('f-lday-date').value, // empty = today
+    start: $('f-lday-start').value,
+    end: $('f-lday-end').value,
+  });
+  $('lday-error').textContent = res.ok ? '' : res.message;
+  $('lday-error').hidden = res.ok;
+  if (res.ok) $('f-lday-date').value = '';
 }
 
 function closeSettings() {
@@ -727,7 +884,8 @@ async function saveSettings(e) {
       overdueDays: Number($('f-overdue').value),
       adminGroup: $('f-admin-group').value.trim(),
       teamGroup: $('f-team-group').value.trim(),
-      jiraAdminsAreAdmins: $('f-jira-admins').checked,
+      lunchStart: $('f-lunch-start').value,
+      lunchEnd: $('f-lunch-end').value,
       categoryField: category,
       demo: $('f-demo').checked,
     },
@@ -750,6 +908,7 @@ $('cancel-settings').addEventListener('click', closeSettings);
 $('drawer-backdrop').addEventListener('click', closeSettings);
 $('settings-form').addEventListener('submit', saveSettings);
 $('settings-form').addEventListener('change', syncSettingsFields);
+$('f-lday-add').addEventListener('click', addLunchChange);
 $('problem-signin').addEventListener('click', () => jwh.signIn());
 $('problem-retry').addEventListener('click', () => jwh.refresh());
 $('problem-demo').addEventListener('click', () => {

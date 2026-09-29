@@ -13,7 +13,10 @@ const DEFAULTS = Object.freeze({
   overdueDays: 3,             // a task counts as overdue when its due date is more than this many days ago
   adminGroup: '',             // members of this Jira group see the team dashboard (empty = off)
   teamGroup: '',              // the Jira group whose members the team dashboard shows
-  jiraAdminsAreAdmins: false, // also treat Jira administrators (global permission) as dashboard admins
+  lunchStart: '12:00',        // standard lunch break, every workday ('' = none)
+  lunchEnd: '13:00',
+  lunchOverrides: [],         // [{ date: 'YYYY-MM-DD', start: '12:30', end: '13:00' }], start '' = no lunch that day
+  teamMembers: [],            // people an admin picked for the team dashboard: [{ id, jql, displayName }]
   demo: false,
 });
 
@@ -88,9 +91,49 @@ function normalizeSettings(raw) {
   const adminGroup = String(s.adminGroup || '').trim().slice(0, 255);
   const teamGroup = String(s.teamGroup || '').trim().slice(0, 255);
 
-  const jiraAdminsAreAdmins = s.jiraAdminsAreAdmins === true || s.jiraAdminsAreAdmins === 'true' || s.jiraAdminsAreAdmins === '1' || s.jiraAdminsAreAdmins === 1;
+  const lunch = checkLunch(s.lunchStart, s.lunchEnd, 'The lunch break');
+  const lunchOverrides = normalizeLunchOverrides(s.lunchOverrides);
 
-  return { baseUrl, auth, email, targetHours, categoryField, refreshTimes, autoRefreshMinutes, overdueDays, adminGroup, teamGroup, jiraAdminsAreAdmins, demo: !!s.demo };
+  const teamMembers = (Array.isArray(s.teamMembers) ? s.teamMembers : [])
+    .filter((m) => m && m.id && m.jql)
+    .map((m) => ({ id: String(m.id), jql: String(m.jql), displayName: String(m.displayName || m.jql).slice(0, 120) }))
+    .filter((m, i, all) => all.findIndex((x) => x.id === m.id) === i)
+    .slice(0, 60);
+
+  return {
+    baseUrl, auth, email, targetHours, categoryField, refreshTimes, autoRefreshMinutes, overdueDays, adminGroup, teamGroup,
+    lunchStart: lunch.start, lunchEnd: lunch.end, lunchOverrides, teamMembers, demo: !!s.demo,
+  };
+}
+
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const toMin = (t) => Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
+
+// A lunch break is either empty (none) or a start and end time with the end after the start
+function checkLunch(startRaw, endRaw, what) {
+  const start = String(startRaw || '').trim();
+  const end = String(endRaw || '').trim();
+  if (!start && !end) return { start: '', end: '' };
+  if (!TIME_RE.test(start) || !TIME_RE.test(end)) throw new Error(`${what} needs a start and an end time like 12:00 and 13:00.`);
+  if (toMin(end) <= toMin(start)) throw new Error(`${what} must end after it starts.`);
+  return { start, end };
+}
+
+function normalizeLunchOverrides(list) {
+  const byDate = new Map();
+  for (const o of Array.isArray(list) ? list : []) {
+    if (!o || !parseDateKey(o.date)) continue;
+    const lunch = checkLunch(o.start, o.end, `The lunch break on ${o.date}`);
+    byDate.set(o.date, { date: o.date, ...lunch }); // the last change for a date wins
+  }
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-120);
+}
+
+// Lunch break for a given day: a one-day change if there is one, otherwise the standard
+function lunchFor(settings, dayKey) {
+  const o = (settings.lunchOverrides || []).find((x) => x.date === dayKey);
+  const l = o || { start: settings.lunchStart, end: settings.lunchEnd };
+  return l.start && l.end ? { start: l.start, end: l.end, changed: !!o } : null;
 }
 
 // ------------------------------------------------------------------- dates
@@ -270,26 +313,113 @@ async function connect(fetchJson, settings) {
   const me = await fetchJson(`/rest/api/${api}/myself?expand=groups`);
   const category = await resolveCategoryField(fetchJson, api, settings.categoryField);
   const groupNames = (me.groups && Array.isArray(me.groups.items) ? me.groups.items : []).map((g) => String(g.name || '')).filter(Boolean).sort((a, b) => a.localeCompare(b));
-  // Jira administrator (global "Administer Jira" permission), whatever the admin group is called
-  let jiraAdmin = false;
-  try {
-    const perms = await fetchJson(`/rest/api/${api}/mypermissions?permissions=ADMINISTER`);
-    jiraAdmin = !!(perms && perms.permissions && perms.permissions.ADMINISTER && perms.permissions.ADMINISTER.havePermission);
-  } catch (err) {
-    if (err.kind === 'network') throw err;
-  }
-  return { deployment, api, me, category, groupNames, groups: groupNames.map((g) => g.toLowerCase()), jiraAdmin, displayName: me.displayName || me.name || 'you' };
+  const groups = groupNames.map((g) => g.toLowerCase());
+  const roles = await loadProjectRoles(fetchJson, api, deployment, me, groups);
+  return { deployment, api, me, category, groupNames, groups, roles, displayName: me.displayName || me.name || 'you' };
 }
 
-// Admin = member of the configured Jira group, or (if allowed in settings) a Jira administrator.
-// Both are checked by Jira, not by the app.
-function isAdminOf(ctx, adminGroup, allowJiraAdmins = false) {
+const MAX_PROJECTS = 300;
+
+// Runs fn over items, a few at a time
+async function inPool(items, size, fn) {
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const i = next++; await fn(items[i]); } };
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, worker));
+}
+
+// Who may see the Team tab, read from each project's settings (Project settings > People):
+// the project lead, and everyone in the project's "Administrators" role (directly or via a group).
+async function loadProjectRoles(fetchJson, api, deployment, me, myGroups) {
+  const roles = { leadOf: [], adminOf: [], projectsChecked: 0 };
+  const mine = userKey(me);
+  const isMe = (u) => !!u && ((me.accountId && u.accountId === me.accountId) || (me.name && u.name === me.name) || (me.key && u.key === me.key) || userKey(u) === mine);
+  let projects = [];
+  try {
+    if (deployment === 'cloud') {
+      for (let startAt = 0, guard = 0; guard < 20 && projects.length < MAX_PROJECTS; guard++) {
+        const page = await fetchJson(`/rest/api/3/project/search?expand=lead&maxResults=50&startAt=${startAt}`);
+        const values = Array.isArray(page.values) ? page.values : [];
+        projects.push(...values);
+        startAt += values.length;
+        if (!values.length || page.isLast) break;
+      }
+    } else {
+      const list = await fetchJson('/rest/api/2/project?expand=lead');
+      projects = Array.isArray(list) ? list : [];
+    }
+  } catch (err) {
+    if (err.kind === 'network') throw err;
+    return roles; // Jira did not list projects: nobody gets the Team tab this way
+  }
+  projects = projects.filter((pr) => pr && pr.key).slice(0, MAX_PROJECTS);
+  roles.projectsChecked = projects.length;
+  roles.leadOf = projects.filter((pr) => isMe(pr.lead)).map((pr) => pr.key);
+
+  await inPool(projects, 6, async (pr) => {
+    try {
+      const list = await fetchJson(`/rest/api/${api}/project/${encodeURIComponent(pr.key)}/role`);
+      const name = Object.keys(list || {}).find((n) => /^administrators?$/i.test(n.trim()));
+      const id = name && String(list[name]).match(/\/role\/(\d+)\/?$/);
+      if (!id) return;
+      const role = await fetchJson(`/rest/api/${api}/project/${encodeURIComponent(pr.key)}/role/${id[1]}`);
+      const actors = Array.isArray(role && role.actors) ? role.actors : [];
+      const hit = actors.some((a) => {
+        if (/group/i.test(a.type || '')) {
+          const g = String((a.actorGroup && a.actorGroup.name) || a.name || '').toLowerCase();
+          return !!g && myGroups.includes(g);
+        }
+        const u = a.actorUser || {};
+        return isMe({ accountId: u.accountId || a.accountId, name: a.name, key: a.name });
+      });
+      if (hit) roles.adminOf.push(pr.key);
+    } catch (err) {
+      if (err.kind === 'network') throw err; // no permission for one project: skip it
+    }
+  });
+  roles.leadOf.sort();
+  roles.adminOf.sort();
+  return roles;
+}
+
+// Team tab: project leads and project administrators (from the project settings in Jira),
+// plus members of the optional admin group from Settings
+const inAdminGroup = (ctx, adminGroup) => !!(ctx && adminGroup && Array.isArray(ctx.groups) && ctx.groups.includes(String(adminGroup).trim().toLowerCase()));
+function isAdminOf(ctx, adminGroup) {
   if (!ctx) return false;
-  if (allowJiraAdmins && ctx.jiraAdmin) return true;
-  return !!(adminGroup && Array.isArray(ctx.groups) && ctx.groups.includes(String(adminGroup).trim().toLowerCase()));
+  const r = ctx.roles || {};
+  return !!((r.leadOf && r.leadOf.length) || (r.adminOf && r.adminOf.length)) || inAdminGroup(ctx, adminGroup);
+}
+
+// Why someone does (not) see the Team tab, for the hint in Settings
+function adminReasons(ctx, adminGroup) {
+  if (!ctx) return [];
+  const r = ctx.roles || {};
+  const list = (keys) => `${keys.slice(0, 6).join(', ')}${keys.length > 6 ? ` +${keys.length - 6} more` : ''}`;
+  const out = [];
+  if (r.leadOf && r.leadOf.length) out.push(`project lead of ${list(r.leadOf)}`);
+  if (r.adminOf && r.adminOf.length) out.push(`in the Administrators role of ${list(r.adminOf)}`);
+  if (inAdminGroup(ctx, adminGroup)) out.push(`member of ${adminGroup}`);
+  return out;
 }
 
 const userKey = (u) => (u ? String(u.accountId || u.key || u.name || '') : '');
+// How JQL names a user: account ID on Cloud, username on Data Center
+const jqlUser = (u) => (u ? String(u.accountId || u.name || u.key || '') : '');
+const asMember = (u) => ({ id: userKey(u), jql: jqlUser(u), displayName: u.displayName || u.name || userKey(u) });
+
+// Find people by name for the team picker
+async function searchUsers(fetchJson, ctx, query) {
+  const q = String(query || '').trim();
+  if (q.length < 2) return [];
+  const path = ctx.deployment === 'cloud'
+    ? `/rest/api/3/user/search?query=${encodeURIComponent(q)}&maxResults=20`
+    : `/rest/api/2/user/search?username=${encodeURIComponent(q)}&maxResults=20`;
+  const users = await fetchJson(path);
+  return (Array.isArray(users) ? users : [])
+    .filter((u) => u && u.active !== false && (!u.accountType || u.accountType === 'atlassian'))
+    .map(asMember)
+    .filter((m) => m.id && m.jql);
+}
 const jqlString = (text) => `"${String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 
 // Members of a Jira group. Returns null when Jira does not allow listing groups (then the
@@ -302,7 +432,7 @@ async function loadGroupMembers(fetchJson, ctx, group) {
       const values = Array.isArray(page.values) ? page.values : [];
       for (const u of values) {
         if (u.active === false) continue;
-        members.push({ id: userKey(u), displayName: u.displayName || u.name || userKey(u) });
+        members.push(asMember(u));
       }
       startAt += values.length;
       if (!values.length || page.isLast || startAt >= (page.total || 0)) break;
@@ -315,8 +445,15 @@ async function loadGroupMembers(fetchJson, ctx, group) {
 }
 
 // Worklogs between two dates (inclusive, "YYYY-MM-DD"): mine, or a whole group's (opts.group)
+function whoJql(field, opts) {
+  if (opts.selected && opts.selected.length) return `${field} in (${opts.selected.map((m) => jqlString(m.jql)).join(', ')})`;
+  if (opts.group) return `${field} in membersOf(${jqlString(opts.group)})`;
+  return `${field} = currentUser()`;
+}
+
 async function loadEntriesRange(fetchJson, ctx, from, to, opts = {}) {
-  const who = opts.group ? `worklogAuthor in membersOf(${jqlString(opts.group)})` : 'worklogAuthor = currentUser()';
+  if (opts.selected && opts.members === undefined) opts = { ...opts, members: opts.selected };
+  const who = whoJql('worklogAuthor', opts);
   const jql = `${who} AND worklogDate >= "${from}" AND worklogDate <= "${to}"`;
   const { category, me, api } = ctx;
   const issues = await searchIssues(fetchJson, ctx.deployment, jql, category.id ? `summary,${category.id}` : 'summary');
@@ -324,7 +461,7 @@ async function loadEntriesRange(fetchJson, ctx, from, to, opts = {}) {
   const isMine = (a) => !!a && ((me.accountId && a.accountId === me.accountId) || (me.key && a.key === me.key) || (me.name && a.name === me.name));
   // Team mode: keep entries of group members (or of everyone found, when the member list is unknown)
   const memberIds = opts.members ? new Set(opts.members.map((m) => m.id)) : null;
-  const wanted = opts.group ? (a) => !!a && (!memberIds || memberIds.has(userKey(a))) : isMine;
+  const wanted = opts.group || opts.selected ? (a) => !!a && (!memberIds || memberIds.has(userKey(a))) : isMine;
   const entries = [];
   for (const issue of issues) {
     const raw = issue.fields && category.id ? issue.fields[category.id] : null;
@@ -375,7 +512,7 @@ async function loadReport(fetchJson, settings, now) {
 
 // Unresolved tasks whose due date is more than settings.overdueDays days ago
 async function loadOverdue(fetchJson, ctx, settings, now, opts = {}) {
-  const who = opts.group ? `assignee in membersOf(${jqlString(opts.group)})` : 'assignee = currentUser()';
+  const who = whoJql('assignee', opts);
   const jql = `${who} AND resolution = Unresolved AND duedate < startOfDay("-${settings.overdueDays}d") ORDER BY duedate ASC`;
   const issues = await searchIssues(fetchJson, ctx.deployment, jql, 'summary,duedate,assignee,status,priority');
   return overdueItems(issues.map((i) => ({
@@ -470,6 +607,7 @@ function buildReport(entries, me, settings, now, opts = {}) {
     target,
     days,
     today: todayInWeek ? {
+      date: todayKey,
       label: dayLabel(current.today),
       logged: todayLogged,
       missing: todayIsWorkday ? round2(Math.max(0, target - todayLogged)) : 0,
@@ -596,56 +734,49 @@ function pickClockStart({ now, bootTime, appStart, firstActive, manual }) {
   return candidates.length ? new Date(Math.min(...candidates.map((d) => d.getTime()))) : null;
 }
 
-// Today's timeline from the clock start until now: booked in Jira (green), not booked (amber),
-// pauses (screen locked / PC asleep: shown, not subtracted) and breaks (the Pause button:
-// subtracted from the time at work).
-function buildWorkday({ start, now, pauses = [], entries = [] }) {
+// Today's bar: booked hours fill it in green from the start of the day - it does not matter when
+// they were entered in Jira. The rest up to now is not booked (amber); the lunch break is grey
+// and not counted as work time.
+function buildWorkday({ start, now, lunch = null, bookedHours = 0, targetHours = 0 }) {
+  const booked = round2(bookedHours || 0);
+  if (!start) return { running: false, bookedHours: booked };
   const todayKey = dateKey(now);
   const nowMin = minutesOf(now);
-  const today = entries.filter((e) => e.day === todayKey);
-  const bookedHours = round2(today.reduce((s, e) => s + e.hours, 0));
-  if (!start) return { running: false, bookedHours };
+  const startMin = Math.min(nowMin, dateKey(start) === todayKey ? minutesOf(start) : 0);
+  const L = lunch ? { from: toMin(lunch.start), to: toMin(lunch.end) } : null;
+  const overlap = (a, b) => (L ? Math.max(0, Math.min(b, L.to) - Math.max(a, L.from)) : 0);
 
-  const startMin = dateKey(start) === todayKey ? minutesOf(start) : 0;
-  const booked = today
-    .filter((e) => /^\d\d:\d\d$/.test(e.time || ''))
-    .map((e) => {
-      const from = Number(e.time.slice(0, 2)) * 60 + Number(e.time.slice(3, 5));
-      return { from, to: Math.min(24 * 60, from + e.hours * 60), key: e.key, summary: e.summary };
-    })
-    .sort((a, b) => a.from - b.from);
-  const pauseIv = pauses
-    .map((p) => {
-      const from = p.from ? (dateKey(p.from) === todayKey ? minutesOf(p.from) : 0) : null;
-      const to = p.to ? (dateKey(p.to) === todayKey ? minutesOf(p.to) : null) : nowMin;
-      // a pause that started this very minute is still a pause (length 0 for now)
-      if (from === null || to === null || to < from || (to === from && p.to)) return null;
-      return { from: Math.max(from, startMin), to: Math.min(to, nowMin), kind: p.kind || 'lock', ongoing: !p.to };
-    })
-    .filter((p) => p && (p.to > p.from || p.ongoing));
+  const lunchTaken = overlap(startMin, nowMin);
+  const workedMin = Math.max(0, nowMin - startMin - lunchTaken);
 
-  const rangeFrom = Math.min(startMin, ...booked.map((b) => b.from));
-  const rangeTo = Math.max(nowMin, ...booked.map((b) => b.to));
-  const points = new Set([rangeFrom, rangeTo, startMin, nowMin]);
-  for (const iv of [...booked, ...pauseIv]) { points.add(iv.from); points.add(iv.to); }
-  const sorted = [...points].filter((x) => x >= rangeFrom && x <= rangeTo).sort((a, b) => a - b);
+  // walk forward from the start by some work minutes, skipping the lunch break
+  const advance = (minutes) => {
+    const end = startMin + minutes;
+    return L && end > L.from && startMin < L.to ? end + Math.min(L.to - L.from, L.to - Math.max(startMin, L.from)) : end;
+  };
+  const greenEnd = advance(booked * 60);
+  // the bar shows the whole day: from the start until the daily target is reached (lunch included)
+  const targetEnd = targetHours > 0 ? advance(targetHours * 60) : 0;
+  const rangeFrom = startMin;
+  const rangeTo = Math.min(24 * 60, Math.max(nowMin, greenEnd, targetEnd, rangeFrom + 1));
 
+  const cuts = new Set([rangeFrom, rangeTo, nowMin, greenEnd]);
+  if (L) { cuts.add(L.from); cuts.add(L.to); }
+  const points = [...cuts].filter((x) => x >= rangeFrom && x <= rangeTo).sort((a, b) => a - b);
   const segments = [];
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const a = sorted[i];
-    const b = sorted[i + 1];
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
     if (b - a < 0.01) continue;
     const mid = (a + b) / 2;
-    const bk = booked.find((x) => x.from <= mid && x.to > mid);
-    let seg;
-    if (bk) seg = { kind: 'booked', key: bk.key, summary: bk.summary };
-    else if (mid < startMin || mid > nowMin) continue; // outside the workday, nothing booked
-    else if (pauseIv.some((p) => p.kind === 'manual' && p.from <= mid && p.to > mid)) seg = { kind: 'break' };
-    else if (pauseIv.some((p) => p.from <= mid && p.to > mid)) seg = { kind: 'pause' };
-    else seg = { kind: 'open' };
+    let kind;
+    if (L && mid >= L.from && mid < L.to) kind = 'lunch';
+    else if (mid < greenEnd) kind = 'booked';
+    else if (mid < nowMin) kind = 'open';
+    else continue;
     const last = segments[segments.length - 1];
-    if (last && last.kind === seg.kind && last.key === seg.key && Math.abs(last.toMin - a) < 0.01) last.toMin = b;
-    else segments.push({ ...seg, fromMin: a, toMin: b });
+    if (last && last.kind === kind && Math.abs(last.toMin - a) < 0.01) last.toMin = b;
+    else segments.push({ kind, fromMin: a, toMin: b });
   }
   for (const sg of segments) {
     sg.from = hhmm(sg.fromMin);
@@ -653,28 +784,21 @@ function buildWorkday({ start, now, pauses = [], entries = [] }) {
     sg.minutes = Math.round(sg.toMin - sg.fromMin);
   }
 
-  const auto = pauseIv.filter((p) => p.kind !== 'manual');
-  const manual = pauseIv.filter((p) => p.kind === 'manual');
-  const breakMinutes = Math.round(manual.reduce((s, p) => s + (p.to - p.from), 0));
-  const elapsedHours = round2(Math.max(0, nowMin - startMin - breakMinutes) / 60);
-  const pauseMinutes = Math.round(auto.reduce((s, p) => s + (p.to - p.from), 0));
-  const onBreak = manual.find((p) => p.ongoing);
+  const elapsedHours = round2(workedMin / 60);
   return {
     running: true,
     start: hhmm(startMin),
     now: hhmm(nowMin),
+    nowMin,
     elapsedHours,
-    bookedHours,
-    openHours: round2(Math.max(0, elapsedHours - bookedHours)),
-    pauseMinutes,
-    breakMinutes,
-    onBreak: onBreak ? hhmm(onBreak.from) : null,
+    bookedHours: booked,
+    openHours: round2(Math.max(0, elapsedHours - booked)),
+    aheadHours: round2(Math.max(0, booked - elapsedHours)),
+    lunch: lunch ? { start: lunch.start, end: lunch.end, changed: !!lunch.changed, takenMinutes: Math.round(lunchTaken) } : null,
+    targetEnd: targetEnd ? hhmm(targetEnd) : null,
     rangeFrom,
     rangeTo,
     segments,
-    gaps: segments.filter((sg) => sg.kind === 'open' && sg.minutes >= 5).map(({ from, to, minutes }) => ({ from, to, minutes })),
-    pauses: auto.map((p) => ({ from: hhmm(p.from), to: p.ongoing ? null : hhmm(p.to), minutes: Math.round(p.to - p.from), kind: p.kind })),
-    breaks: manual.map((p) => ({ from: hhmm(p.from), to: p.ongoing ? null : hhmm(p.to), minutes: Math.round(p.to - p.from) })),
   };
 }
 
@@ -796,18 +920,29 @@ function demoReport(now, bumps, settings, weekDate) {
 }
 
 const DEMO_TEAM = [
-  { id: 'demo-anna', displayName: 'Anna Berger' },
-  { id: 'demo-luca', displayName: 'Luca Rossi' },
-  { id: 'demo-me', displayName: 'Demo user' },
-  { id: 'demo-sara', displayName: 'Sara Kofler' },
-  { id: 'demo-tom', displayName: 'Tom Huber' },
+  { id: 'demo-anna', jql: 'aberger', displayName: 'Anna Berger' },
+  { id: 'demo-luca', jql: 'lrossi', displayName: 'Luca Rossi' },
+  { id: 'demo-me', jql: 'demo', displayName: 'Demo user' },
+  { id: 'demo-sara', jql: 'skofler', displayName: 'Sara Kofler' },
+  { id: 'demo-tom', jql: 'thuber', displayName: 'Tom Huber' },
+  { id: 'demo-mia', jql: 'mwalder', displayName: 'Mia Walder' },
+  { id: 'demo-jonas', jql: 'jpichler', displayName: 'Jonas Pichler' },
 ];
+// Demo team: whoever is picked in the member list, or the first five
+const demoMembers = (settings) => {
+  const picked = new Set((settings.teamMembers || []).map((m) => m.id));
+  return picked.size ? DEMO_TEAM.filter((m) => picked.has(m.id)) : DEMO_TEAM.slice(0, 5);
+};
+const demoSearchUsers = (query) => {
+  const q = String(query || '').trim().toLowerCase();
+  return q.length < 2 ? [] : DEMO_TEAM.filter((m) => m.displayName.toLowerCase().includes(q) || m.jql.includes(q));
+};
 
 // Each demo colleague has a habit: some always complete, some forget Fridays, one logs short days
 function demoTeamEntries(from, to, now, bumps, settings) {
   const entries = [];
   const todayKey = dateKey(now);
-  for (const m of DEMO_TEAM) {
+  for (const m of demoMembers(settings)) {
     const base = m.id === 'demo-me' ? demoEntries(from, to, now, bumps) : demoEntries(from, to, now, 0);
     const dayTotals = new Map();
     for (const e of base) dayTotals.set(e.day, (dayTotals.get(e.day) || 0) + e.hours);
@@ -815,7 +950,7 @@ function demoTeamEntries(from, to, now, bumps, settings) {
       const weekday = (parseDateKey(e.day).getDay() + 6) % 7;
       let hours = e.hours;
       if (m.id === 'demo-luca' && weekday === 4 && e.day !== todayKey) continue;   // forgets Fridays
-      if (m.id === 'demo-tom') hours = Math.round(hours * 0.8 * 4) / 4;           // short days
+      if (m.id === 'demo-tom' || m.id === 'demo-jonas') hours = Math.round(hours * 0.8 * 4) / 4;           // short days
       if (m.id === 'demo-sara' && e.day === todayKey) continue;                     // hasn't logged today yet
       if (m.id === 'demo-anna' && e.day !== todayKey) hours = (e.hours * 8) / dayTotals.get(e.day); // always complete
       entries.push({ ...e, id: `${m.id}-${e.id}`, hours, user: m.id, userName: m.displayName });
@@ -826,7 +961,7 @@ function demoTeamEntries(from, to, now, bumps, settings) {
 
 function demoTeamWeek(now, bumps, settings, weekDate) {
   const week = weekOf(weekDate || now);
-  return buildTeamWeek(demoTeamEntries(week.from, week.to, now, bumps, settings), DEMO_TEAM, settings, now, { weekDate });
+  return buildTeamWeek(demoTeamEntries(week.from, week.to, now, bumps, settings), demoMembers(settings), settings, now, { weekDate });
 }
 
 function demoOverdue(now, settings, team) {
@@ -839,7 +974,8 @@ function demoOverdue(now, settings, team) {
     { key: 'IT-91', summary: 'Printer rollout floor 2', due: ago(8), assignee: 'Luca Rossi', status: 'In Progress', priority: 'Medium' },
     { key: 'IT-99', summary: 'Access review Q3', due: ago(4), assignee: 'Sara Kofler', status: 'Open', priority: 'High' },
   ];
-  return overdueItems(team ? all : all.filter((i) => i.assignee === 'Demo user'), settings, now);
+  const names = new Set(demoMembers(settings).map((m) => m.displayName));
+  return overdueItems(all.filter((i) => (team ? names.has(i.assignee) : i.assignee === 'Demo user')), settings, now);
 }
 
 function demoMonth(now, bumps, settings, year, month) {
@@ -851,5 +987,5 @@ module.exports = {
   DEFAULTS, REFRESH_CHOICES, JiraError, cleanBaseUrl, normalizeSettings, weekOf, dateKey, parseDateKey, isoWeek, monthGrid,
   nextUpdateText, fieldText, sprintText, commentText, makeJsonFetcher, detectDeployment, connect, loadEntriesRange,
   loadReport, buildReport, buildMonth, trayInfo, formatRemaining, exportCsv, demoEntries, demoReport, demoMonth,
-  pickClockStart, buildWorkday, formatMinutes, isAdminOf, userKey, jqlString, loadGroupMembers, loadOverdue, overdueItems, buildTeamWeek, demoTeamWeek, demoOverdue, DEMO_TEAM,
+  pickClockStart, buildWorkday, formatMinutes, lunchFor, checkLunch, isAdminOf, adminReasons, searchUsers, asMember, userKey, jqlString, loadGroupMembers, loadOverdue, overdueItems, buildTeamWeek, demoTeamWeek, demoOverdue, demoMembers, demoSearchUsers, DEMO_TEAM,
 };

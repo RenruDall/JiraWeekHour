@@ -14,13 +14,14 @@ Jira stores every worklog, but it has no personal day or week view. Jira Week Ho
 
 - **Tray icon** with the hours still missing today; a green check once you reach your target.
 - **Week view**: every day with its sprints, tickets and hours, plus weekly totals per sprint.
-- **Work clock**: starts when your PC starts and keeps ticking. It compares the time at work with what you booked in Jira and shows the gaps still to book (booked = green, not booked = amber, pauses = grey).
+- **Today's bar**: shows your workday from the start until the daily target. Hours booked in Jira fill it green from the left; it doesn't matter when you entered them. Time at work that isn't booked yet is amber. The lunch break is grey and isn't counted.
+- **Lunch break**: set your standard lunch once, and change it for a single day when needed.
 - **Browse back** through earlier weeks with the ‹ › arrows; "This week" jumps back.
 - **Calendar**: a month view with every day coloured by logged hours (target reached / partly / nothing). Click a week to open it.
 - **Log**: every single worklog entry with start time, duration, ticket, sprint and your comment - the protocol as it is stored in Jira.
 - **Export** the week as a **PDF report** with bar charts (per day stacked by sprint, per sprint, per ticket) plus the full worklog, or as **CSV** for Excel.
 - **Overdue tasks**: your unresolved tasks whose due date is more than *N* days ago (you choose *N*).
-- **Team dashboard for admins**: members of an admin group in Jira see everyone in a team group at a glance - hours per person and day, what is missing, each person's sprints and tickets, and the team's overdue tasks. Everybody else only sees their own hours.
+- **Team dashboard for project leads and project administrators**: they pick the people they want to see from a member list (search by name, tick the boxes). The dashboard shows hours per person and day, what is missing, each person's sprints and tickets, and their overdue tasks. Everybody else only sees their own hours.
 - **Automatic updates** every 15 min to 4 h (your choice, or off), plus reminder times (default 12:00 and 16:00) that notify you if hours are missing. "Update now" works any time.
 - **Works with Jira Cloud and Jira Data Center.** Paste your Jira address; the app detects which one it is.
 - **Start with Windows**, and closing the window keeps it running in the tray.
@@ -58,28 +59,37 @@ Some single sign-on providers (Google in particular) refuse sign-in from embedde
 | Update every | 1 hour | Off, 15 min, 30 min, 1 h, 2 h or 4 h - quiet background update |
 | Reminder times | 12:00, 16:00 | Update + notification if hours are missing, e.g. `10:00, 12:00, 16:00` |
 | Task counts as overdue after | 3 days | Unresolved tasks more than this many days past their due date |
-| Admin group | *(empty = off)* | Jira group whose members see the team dashboard, spelled exactly as in Jira (Settings lists your groups) |
-| Jira administrators are admins too | off | Anyone with Jira's global *Administer Jira* permission also sees the team dashboard |
-| Team group | *(empty)* | Jira group shown on the team dashboard |
+| Lunch break | 12:00-13:00 | Every workday; leave both times empty for none. *Change it for one day* sets different lunch times for one date; without a date it applies to today |
+| Extra admin group | *(empty)* | Optional Jira group whose members also see the team dashboard, spelled exactly as in Jira (Settings lists your groups) |
+| Team group | *(optional)* | Offered in the member list, and shown while nobody is picked |
 | Group hours by | Sprint | Also issue type, project, component, labels or any custom field (`customfield_12345`) |
 
-### Work clock
+### Today's bar
 
-The clock starts at the first sign of PC use today: Windows starting (if that was today), the app starting, or the first unlock / wake-up. The installer switches on *Start with Windows*, so the app is running from the moment you log in. If the start is wrong (for example you started working before switching on the PC), use **Edit start**.
+The bar runs from the start of your day until the point where the daily target is reached, lunch included. It starts at the first sign of PC use today: Windows starting (if that was today), the app starting, or the first unlock / wake-up. The installer switches on *Start with Windows*, so the app is running from the moment you log in. If the start is wrong (for example you started working before switching on the PC), use **Edit start**.
 
-- **At work** = now minus the start, minus your breaks. Pauses (screen locked, PC asleep) are listed but **not subtracted**.
-- **Pause** (under *Update now*, also in the tray menu) starts a break, e.g. lunch; **Resume work** ends it. Breaks are **subtracted** from the time at work and are not gaps to book. Unlocking the PC after a break also ends it.
-- **Booked in Jira** = today's worklogs. **Not booked** = at work minus booked.
-- The timeline shows which periods are not booked yet; book them in Jira as usual (**Book in Jira** opens it), then *Update now*.
-- The clock is stored only on your PC (`%APPDATA%\Jira Week Hours\clock.json`, last 60 days). It is never sent to Jira and never appears on the team dashboard.
+- **Booked in Jira** (green) = today's worklogs, stacked from the start of the day. The time of day you entered a worklog doesn't matter.
+- **Not booked yet** (amber) = time at work so far that is not booked. Book it in Jira as usual (**Book in Jira** opens it), then *Update now*.
+- **Lunch break** (grey) is not counted as work time. **Change lunch** changes it for today only; the standard lunch break is in Settings.
+- **At work** = now minus the start, minus the lunch break.
+- The start time is stored only on your PC (`%APPDATA%\Jira Week Hours\clock.json`, last 60 days). It is never sent to Jira and never appears on the team dashboard.
 
-![Work clock](docs/workclock.png)
+![Today's bar](docs/workclock.png)
 
 ### Team dashboard
 
-The team dashboard stays off until an **admin group** (or *Jira administrators are admins too*) and a **team group** are set. Admin status is checked by Jira: the app asks Jira which groups you belong to and whether you are a Jira administrator.
+The Team tab is shown to:
 
-**No Team tab?** Open Settings: under *Team dashboard* it lists your Jira groups exactly as Jira spells them and says why you are or aren't an admin. Jira's built-in admin group is usually `jira-administrators` (Data Center) or `administrators` / `site-admins` (Cloud), not "Administrator".
+- the **project lead** of any project, and
+- anyone in a project's **Administrators** role, directly or through a group.
+
+Both are read from Jira's own project settings (*Project settings › People*) when the app connects, so nothing needs to be set up in the app. The app checks the projects you can see in Jira (up to 300). Members of the optional **extra admin group** see the Team tab too.
+
+In the Team tab, **Members** opens the member list: search people in Jira by name (at least 2 letters), tick the ones you want, and click **Apply**. The list is saved. While nobody is picked, the dashboard shows the **team group** if one is set.
+
+![Member list](docs/members.png)
+
+**No Team tab?** Ask a Jira administrator to make you project lead or add you to a project's Administrators role under *Project settings › People*, then restart the app.
 
 IT can fix the address and the groups centrally so users cannot change them, for example with Intune:
 
@@ -88,7 +98,6 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Policies\JiraWeekHours
   BaseUrl     REG_SZ   https://jira.your-company.com
   AdminGroup  REG_SZ   it-team-leads
   TeamGroup   REG_SZ   it-italy
-  JiraAdminsAreAdmins  REG_SZ   1
 ```
 
 What the dashboard can show is still limited by **Jira's own permissions**: an admin sees colleagues' worklogs only on projects they may browse in Jira. The app adds no extra access.

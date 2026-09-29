@@ -119,10 +119,12 @@ function saveClock() {
   } catch { /* not critical */ }
 }
 
+let screenLocked = false; // in memory only: a locked PC at midnight does not start the next day
+
 function clockDay(date = new Date()) {
   const key = core.dateKey(date);
   const days = loadClock().days;
-  if (!days[key]) days[key] = { appStart: null, firstActive: null, manual: null, pauses: [] };
+  if (!days[key]) days[key] = { appStart: null, firstActive: null, manual: null };
   return days[key];
 }
 
@@ -137,58 +139,21 @@ function markActive(now = new Date()) {
   if (!day.firstActive) { day.firstActive = now.toISOString(); saveClock(); }
 }
 
-function openPause(kind) {
-  const now = new Date();
-  const day = clockDay(now);
-  const open = day.pauses.find((p) => !p.to);
-  if (!open) { day.pauses.push({ from: now.toISOString(), to: null, kind }); saveClock(); }
-}
-
-function closePause() {
-  const now = new Date();
-  const days = loadClock().days;
-  for (const key of Object.keys(days)) {
-    for (const p of days[key].pauses) {
-      if (p.to) continue;
-      // a pause that began on an earlier day ends at that day's midnight
-      p.to = key === core.dateKey(now) ? now.toISOString() : new Date(core.parseDateKey(key).getTime() + 86400000 - 1000).toISOString();
-    }
-  }
-  markActive(now);
-  saveClock();
-}
-
-// The Pause button: a deliberate break (lunch) that is subtracted from the time at work.
-// Unlocking the PC after a break also ends it.
-function toggleBreak() {
-  const now = new Date();
-  const day = clockDay(now);
-  const open = day.pauses.find((p) => !p.to);
-  if (open && open.kind === 'manual') {
-    open.to = now.toISOString();
-  } else {
-    if (open) open.to = now.toISOString();
-    day.pauses.push({ from: now.toISOString(), to: null, kind: 'manual' });
-  }
-  saveClock();
-  pushState();
-}
-
+// Today's bar: booked hours fill it from the start, no matter when they were entered in Jira;
+// the lunch break (Settings) is grey and not counted as work time.
 function computeWorkday() {
   const settings = loadSettings();
   const now = new Date();
   const todayKey = core.dateKey(now);
-  const entries = state.report && state.report.isCurrentWeek ? state.report.log.filter((e) => e.day === todayKey) : [];
-  if (settings.demo) {
-    const at = (h, m) => new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
-    const start = at(7, 50) < now ? at(7, 50) : now;
-    const pauses = at(12, 45) < now ? [{ from: at(12, 5), to: at(12, 45), kind: 'lock' }] : [];
-    // the Pause button also works in demo mode
-    for (const p of clockDay(now).pauses) if (p.kind === 'manual') pauses.push({ from: new Date(p.from), to: p.to ? new Date(p.to) : null, kind: 'manual' });
-    return { ...core.buildWorkday({ start, now, pauses, entries }), manual: false, demo: true };
-  }
+  const today = state.report && state.report.today;
+  const bookedHours = today && today.date === todayKey ? today.logged : 0;
+  const lunch = core.lunchFor(settings, todayKey);
   const day = clockDay(now);
   const manual = day.manual ? new Date(day.manual) : null;
+  if (settings.demo && !manual) {
+    const at = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 7, 50);
+    return { ...core.buildWorkday({ start: at < now ? at : now, now, lunch, bookedHours, targetHours: settings.targetHours }), manual: false, demo: true };
+  }
   const start = core.pickClockStart({
     now,
     bootTime: BOOT_TIME,
@@ -196,8 +161,26 @@ function computeWorkday() {
     firstActive: day.firstActive ? new Date(day.firstActive) : null,
     manual,
   });
-  const pauses = day.pauses.map((p) => ({ from: new Date(p.from), to: p.to ? new Date(p.to) : null, kind: p.kind }));
-  return { ...core.buildWorkday({ start, now, pauses, entries }), manual: !!manual, bootToday: core.dateKey(BOOT_TIME) === todayKey };
+  return { ...core.buildWorkday({ start, now, lunch, bookedHours, targetHours: settings.targetHours }), manual: !!manual, bootToday: core.dateKey(BOOT_TIME) === todayKey };
+}
+
+// A lunch break for one day ("YYYY-MM-DD", empty = today). start/end empty = no lunch that day;
+// remove = back to the standard lunch break.
+function setLunchDay(input) {
+  const current = loadSettings();
+  const date = String((input && input.date) || '').trim() || core.dateKey(new Date());
+  if (!core.parseDateKey(date)) throw new Error('Pick a valid date.');
+  let list = current.lunchOverrides.filter((o) => o.date !== date);
+  if (!(input && input.remove)) {
+    const lunch = core.checkLunch(input && input.start, input && input.end, 'The lunch break');
+    list.push({ date, ...lunch });
+  }
+  // changes older than 60 days are no longer needed
+  const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 60);
+  list = list.filter((o) => o.date >= core.dateKey(cutoff));
+  writeSettings(core.normalizeSettings({ ...current, lunchOverrides: list, ...state.policy }));
+  pushState();
+  return { date };
 }
 
 function setClockStart(value) {
@@ -294,23 +277,36 @@ async function loadMonth(year, month) {
 
 function isAdmin(settings) {
   if (settings.demo) return true; // the demo shows the team view with sample colleagues
-  return core.isAdminOf(state.ctx, settings.adminGroup, settings.jiraAdminsAreAdmins);
+  return core.isAdminOf(state.ctx, settings.adminGroup);
+}
+
+async function adminContext(settings) {
+  const fetchJson = makeFetcher(settings);
+  const ctx = await jiraContext(fetchJson, settings);
+  if (!core.isAdminOf(ctx, settings.adminGroup)) throw new Error('Only project leads and project administrators can see the team dashboard.');
+  return { fetchJson, ctx };
+}
+
+// Whom the team dashboard shows: the people picked in the member list, otherwise the team group
+async function teamScope(fetchJson, ctx, settings) {
+  if (settings.teamMembers.length) return { selected: settings.teamMembers, members: settings.teamMembers };
+  if (!settings.teamGroup) return null;
+  if (!state.members || state.members.group !== settings.teamGroup) {
+    state.members = { group: settings.teamGroup, list: await core.loadGroupMembers(fetchJson, ctx, settings.teamGroup) };
+  }
+  return { group: settings.teamGroup, members: state.members.list };
 }
 
 async function loadTeamWeek(weekStart) {
   const settings = loadSettings();
   const weekDate = core.parseDateKey(weekStart) || new Date();
   if (settings.demo) return core.demoTeamWeek(new Date(), demoBumps, settings, weekDate);
-  const fetchJson = makeFetcher(settings);
-  const ctx = await jiraContext(fetchJson, settings);
-  if (!core.isAdminOf(ctx, settings.adminGroup, settings.jiraAdminsAreAdmins)) throw new Error('Only members of the admin group can see the team dashboard.');
-  if (!settings.teamGroup) throw new Error('No team group set. Add it in Settings.');
-  if (!state.members || state.members.group !== settings.teamGroup) {
-    state.members = { group: settings.teamGroup, list: await core.loadGroupMembers(fetchJson, ctx, settings.teamGroup) };
-  }
+  const { fetchJson, ctx } = await adminContext(settings);
+  const scope = await teamScope(fetchJson, ctx, settings);
+  if (!scope) return { ...core.buildTeamWeek([], [], settings, new Date(), { weekDate }), rows: [], needsMembers: true };
   const week = core.weekOf(weekDate);
-  const entries = await core.loadEntriesRange(fetchJson, ctx, week.from, week.to, { group: settings.teamGroup, members: state.members.list });
-  return core.buildTeamWeek(entries, state.members.list, settings, new Date(), { weekDate });
+  const entries = await core.loadEntriesRange(fetchJson, ctx, week.from, week.to, scope);
+  return core.buildTeamWeek(entries, scope.members, settings, new Date(), { weekDate });
 }
 
 async function loadOverdue(scope) {
@@ -318,14 +314,45 @@ async function loadOverdue(scope) {
   const now = new Date();
   const team = scope === 'team';
   if (settings.demo) return core.demoOverdue(now, settings, team);
-  const fetchJson = makeFetcher(settings);
-  const ctx = await jiraContext(fetchJson, settings);
-  if (team) {
-    if (!core.isAdminOf(ctx, settings.adminGroup, settings.jiraAdminsAreAdmins)) throw new Error('Only members of the admin group can see the team\'s overdue tasks.');
-    if (!settings.teamGroup) throw new Error('No team group set. Add it in Settings.');
-    return core.loadOverdue(fetchJson, ctx, settings, now, { group: settings.teamGroup });
+  if (!team) {
+    const fetchJson = makeFetcher(settings);
+    return core.loadOverdue(fetchJson, await jiraContext(fetchJson, settings), settings, now);
   }
-  return core.loadOverdue(fetchJson, ctx, settings, now);
+  const { fetchJson, ctx } = await adminContext(settings);
+  const who = await teamScope(fetchJson, ctx, settings);
+  if (!who) return [];
+  return core.loadOverdue(fetchJson, ctx, settings, now, who.selected ? { selected: who.selected } : { group: who.group });
+}
+
+// Member picker: search Jira users by name (admins only)
+async function searchUsers(query) {
+  const settings = loadSettings();
+  if (settings.demo) return core.demoSearchUsers(query);
+  const { fetchJson, ctx } = await adminContext(settings);
+  return core.searchUsers(fetchJson, ctx, query);
+}
+
+// Member picker: the people offered without searching (picked ones + the team group)
+async function teamCandidates() {
+  const settings = loadSettings();
+  if (settings.demo) return { selected: core.demoMembers(settings), group: core.DEMO_TEAM };
+  const { fetchJson, ctx } = await adminContext(settings);
+  let group = [];
+  if (settings.teamGroup) {
+    if (!state.members || state.members.group !== settings.teamGroup) {
+      state.members = { group: settings.teamGroup, list: await core.loadGroupMembers(fetchJson, ctx, settings.teamGroup) };
+    }
+    group = state.members.list || [];
+  }
+  return { selected: settings.teamMembers, group };
+}
+
+async function setTeamMembers(list) {
+  const settings = loadSettings();
+  if (!settings.demo) await adminContext(settings);
+  const next = core.normalizeSettings({ ...settings, teamMembers: Array.isArray(list) ? list : [], ...state.policy });
+  writeSettings(next);
+  return next.teamMembers;
 }
 
 function resetProgress() {
@@ -356,7 +383,7 @@ function pushState() {
     workday: computeWorkday(),
     version: app.getVersion(),
     // shown in Settings so a mismatching group name is easy to spot
-    access: state.ctx ? { groups: state.ctx.groupNames || [], jiraAdmin: !!state.ctx.jiraAdmin, inAdminGroup: core.isAdminOf(state.ctx, settings.adminGroup) } : null,
+    access: state.ctx ? { groups: state.ctx.groupNames || [], reasons: core.adminReasons(state.ctx, settings.adminGroup), projectsChecked: (state.ctx.roles || {}).projectsChecked || 0 } : null,
     policy: Object.keys(state.policy),
     settingsWarning: state.settingsWarning,
     tray: core.trayInfo(state.report, state.error),
@@ -403,9 +430,7 @@ function tick() {
   const todayKey = core.dateKey(new Date());
   if (lastClockDay && lastClockDay !== todayKey) {
     // the PC was in use across midnight: today's work starts now, unless the screen is locked
-    const yesterday = loadClock().days[lastClockDay];
-    const locked = yesterday && yesterday.pauses.some((p) => !p.to);
-    if (!locked) markActive();
+    if (!screenLocked) markActive();
   }
   lastClockDay = todayKey;
   const settings = loadSettings();
@@ -516,7 +541,6 @@ function buildTrayMenu() {
   return Menu.buildFromTemplate([
     { label: 'Open', click: showMain },
     { label: 'Update now', click: () => refresh('manual') },
-    { label: computeWorkday().onBreak ? 'Resume work' : 'Pause (break)', click: () => toggleBreak() },
     { type: 'separator' },
     ...(process.platform === 'win32'
       ? [{ label: 'Start with Windows', type: 'checkbox', checked: getAutostart(), click: (item) => { setAutostart(item.checked); pushState(); } }]
@@ -587,7 +611,10 @@ function registerIpc() {
   ipcMain.handle('load-week', (_e, weekStart) => safely(loadWeek)(String(weekStart || '')));
   ipcMain.handle('load-month', (_e, year, month) => safely(loadMonth)(Number(year), Number(month)));
   ipcMain.handle('set-clock-start', (_e, value) => safely(setClockStart)(value));
-  ipcMain.on('toggle-break', () => toggleBreak());
+  ipcMain.handle('set-lunch-day', (_e, input) => safely(setLunchDay)(input || {}));
+  ipcMain.handle('search-users', (_e, query) => safely(searchUsers)(String(query || '').slice(0, 100)));
+  ipcMain.handle('team-candidates', () => safely(teamCandidates)());
+  ipcMain.handle('set-team-members', (_e, list) => safely(setTeamMembers)(list));
   ipcMain.on('open-jira', (_e, key) => {
     const settings = loadSettings();
     if (!settings.baseUrl || settings.demo) return;
@@ -664,10 +691,10 @@ function start() {
   lastClockDay = core.dateKey(new Date());
   // right after installation: start with Windows, so the clock starts when the PC starts
   if (FIRST_RUN) { try { setAutostart(true); } catch { /* user can switch it on in the tray menu */ } }
-  powerMonitor.on('lock-screen', () => { openPause('lock'); pushState(); });
-  powerMonitor.on('suspend', () => { openPause('sleep'); pushState(); });
-  powerMonitor.on('unlock-screen', () => { closePause(); pushState(); });
-  powerMonitor.on('resume', () => { closePause(); });
+  powerMonitor.on('lock-screen', () => { screenLocked = true; });
+  powerMonitor.on('suspend', () => { screenLocked = true; });
+  powerMonitor.on('unlock-screen', () => { screenLocked = false; markActive(); pushState(); });
+  powerMonitor.on('resume', () => { screenLocked = false; markActive(); });
   registerIpc();
   createMainWindow();
 
