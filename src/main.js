@@ -158,6 +158,22 @@ function closePause() {
   saveClock();
 }
 
+// The Pause button: a deliberate break (lunch) that is subtracted from the time at work.
+// Unlocking the PC after a break also ends it.
+function toggleBreak() {
+  const now = new Date();
+  const day = clockDay(now);
+  const open = day.pauses.find((p) => !p.to);
+  if (open && open.kind === 'manual') {
+    open.to = now.toISOString();
+  } else {
+    if (open) open.to = now.toISOString();
+    day.pauses.push({ from: now.toISOString(), to: null, kind: 'manual' });
+  }
+  saveClock();
+  pushState();
+}
+
 function computeWorkday() {
   const settings = loadSettings();
   const now = new Date();
@@ -167,6 +183,8 @@ function computeWorkday() {
     const at = (h, m) => new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
     const start = at(7, 50) < now ? at(7, 50) : now;
     const pauses = at(12, 45) < now ? [{ from: at(12, 5), to: at(12, 45), kind: 'lock' }] : [];
+    // the Pause button also works in demo mode
+    for (const p of clockDay(now).pauses) if (p.kind === 'manual') pauses.push({ from: new Date(p.from), to: p.to ? new Date(p.to) : null, kind: 'manual' });
     return { ...core.buildWorkday({ start, now, pauses, entries }), manual: false, demo: true };
   }
   const day = clockDay(now);
@@ -498,6 +516,7 @@ function buildTrayMenu() {
   return Menu.buildFromTemplate([
     { label: 'Open', click: showMain },
     { label: 'Update now', click: () => refresh('manual') },
+    { label: computeWorkday().onBreak ? 'Resume work' : 'Pause (break)', click: () => toggleBreak() },
     { type: 'separator' },
     ...(process.platform === 'win32'
       ? [{ label: 'Start with Windows', type: 'checkbox', checked: getAutostart(), click: (item) => { setAutostart(item.checked); pushState(); } }]
@@ -568,6 +587,7 @@ function registerIpc() {
   ipcMain.handle('load-week', (_e, weekStart) => safely(loadWeek)(String(weekStart || '')));
   ipcMain.handle('load-month', (_e, year, month) => safely(loadMonth)(Number(year), Number(month)));
   ipcMain.handle('set-clock-start', (_e, value) => safely(setClockStart)(value));
+  ipcMain.on('toggle-break', () => toggleBreak());
   ipcMain.on('open-jira', (_e, key) => {
     const settings = loadSettings();
     if (!settings.baseUrl || settings.demo) return;

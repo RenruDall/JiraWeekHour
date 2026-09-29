@@ -432,3 +432,36 @@ test('workday: ongoing pause, bookings before the clock and without a time', () 
   assert.strictEqual(core.formatMinutes(130), '2h 10m');
   assert.strictEqual(core.formatMinutes(45), '45m');
 });
+
+test('Pause button: breaks are subtracted, locked screen is not', () => {
+  const now = new Date(2026, 8, 29, 14, 0);
+  const at = (h, m) => new Date(2026, 8, 29, h, m);
+  const w = core.buildWorkday({
+    start: at(8, 0),
+    now,
+    pauses: [
+      { from: at(12, 0), to: at(12, 45), kind: 'manual' },
+      { from: at(10, 0), to: at(10, 15), kind: 'lock' },
+      { from: at(13, 50), kind: 'manual' }, // on a break right now
+    ],
+    entries: [{ day: '2026-09-29', time: '08:00', hours: 2, key: 'IT-1' }],
+  });
+  assert.strictEqual(w.breakMinutes, 55);
+  assert.strictEqual(w.elapsedHours, round2((6 * 60 - 55) / 60), '6h minus 55 min of breaks');
+  assert.strictEqual(w.pauseMinutes, 15);
+  assert.strictEqual(w.onBreak, '13:50');
+  assert.strictEqual(w.openHours, round2(w.elapsedHours - 2));
+  assert.deepStrictEqual(w.breaks, [{ from: '12:00', to: '12:45', minutes: 45 }, { from: '13:50', to: null, minutes: 10 }]);
+  assert.deepStrictEqual(w.pauses, [{ from: '10:00', to: '10:15', minutes: 15, kind: 'lock' }]);
+  assert.ok(w.segments.some((sg) => sg.kind === 'break' && sg.from === '12:00' && sg.to === '12:45'));
+  assert.ok(w.segments.some((sg) => sg.kind === 'pause' && sg.from === '10:00'));
+  assert.ok(!w.gaps.some((g) => g.from === '12:00'), 'a break is not a gap to book');
+});
+function round2(n) { return Math.round(n * 100) / 100; }
+
+test('a break pressed this very minute already counts as "on a break"', () => {
+  const now = new Date(2026, 8, 29, 12, 30, 10);
+  const w = core.buildWorkday({ start: new Date(2026, 8, 29, 8, 0), now, pauses: [{ from: new Date(2026, 8, 29, 12, 30, 10), kind: 'manual' }], entries: [] });
+  assert.strictEqual(w.onBreak, '12:30');
+  assert.deepStrictEqual(w.breaks, [{ from: '12:30', to: null, minutes: 0 }]);
+});

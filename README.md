@@ -67,7 +67,8 @@ Some single sign-on providers (Google in particular) refuse sign-in from embedde
 
 The clock starts at the first sign of PC use today: Windows starting (if that was today), the app starting, or the first unlock / wake-up. The installer switches on *Start with Windows*, so the app is running from the moment you log in. If the start is wrong (for example you started working before switching on the PC), use **Edit start**.
 
-- **At work** = now minus the start. Pauses (screen locked, PC asleep) are listed but **not subtracted**.
+- **At work** = now minus the start, minus your breaks. Pauses (screen locked, PC asleep) are listed but **not subtracted**.
+- **Pause** (under *Update now*, also in the tray menu) starts a break, e.g. lunch; **Resume work** ends it. Breaks are **subtracted** from the time at work and are not gaps to book. Unlocking the PC after a break also ends it.
 - **Booked in Jira** = today's worklogs. **Not booked** = at work minus booked.
 - The timeline shows which periods are not booked yet; book them in Jira as usual (**Book in Jira** opens it), then *Update now*.
 - The clock is stored only on your PC (`%APPDATA%\Jira Week Hours\clock.json`, last 60 days). It is never sent to Jira and never appears on the team dashboard.

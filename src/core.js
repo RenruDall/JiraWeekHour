@@ -597,7 +597,8 @@ function pickClockStart({ now, bootTime, appStart, firstActive, manual }) {
 }
 
 // Today's timeline from the clock start until now: booked in Jira (green), not booked (amber),
-// pauses (screen locked / PC asleep, shown but not subtracted from the working time).
+// pauses (screen locked / PC asleep: shown, not subtracted) and breaks (the Pause button:
+// subtracted from the time at work).
 function buildWorkday({ start, now, pauses = [], entries = [] }) {
   const todayKey = dateKey(now);
   const nowMin = minutesOf(now);
@@ -617,9 +618,11 @@ function buildWorkday({ start, now, pauses = [], entries = [] }) {
     .map((p) => {
       const from = p.from ? (dateKey(p.from) === todayKey ? minutesOf(p.from) : 0) : null;
       const to = p.to ? (dateKey(p.to) === todayKey ? minutesOf(p.to) : null) : nowMin;
-      return from === null || to === null || to <= from ? null : { from: Math.max(from, startMin), to: Math.min(to, nowMin), kind: p.kind || 'lock', ongoing: !p.to };
+      // a pause that started this very minute is still a pause (length 0 for now)
+      if (from === null || to === null || to < from || (to === from && p.to)) return null;
+      return { from: Math.max(from, startMin), to: Math.min(to, nowMin), kind: p.kind || 'lock', ongoing: !p.to };
     })
-    .filter((p) => p && p.to > p.from);
+    .filter((p) => p && (p.to > p.from || p.ongoing));
 
   const rangeFrom = Math.min(startMin, ...booked.map((b) => b.from));
   const rangeTo = Math.max(nowMin, ...booked.map((b) => b.to));
@@ -637,6 +640,7 @@ function buildWorkday({ start, now, pauses = [], entries = [] }) {
     let seg;
     if (bk) seg = { kind: 'booked', key: bk.key, summary: bk.summary };
     else if (mid < startMin || mid > nowMin) continue; // outside the workday, nothing booked
+    else if (pauseIv.some((p) => p.kind === 'manual' && p.from <= mid && p.to > mid)) seg = { kind: 'break' };
     else if (pauseIv.some((p) => p.from <= mid && p.to > mid)) seg = { kind: 'pause' };
     else seg = { kind: 'open' };
     const last = segments[segments.length - 1];
@@ -649,8 +653,12 @@ function buildWorkday({ start, now, pauses = [], entries = [] }) {
     sg.minutes = Math.round(sg.toMin - sg.fromMin);
   }
 
-  const elapsedHours = round2(Math.max(0, nowMin - startMin) / 60);
-  const pauseMinutes = Math.round(pauseIv.reduce((s, p) => s + (p.to - p.from), 0));
+  const auto = pauseIv.filter((p) => p.kind !== 'manual');
+  const manual = pauseIv.filter((p) => p.kind === 'manual');
+  const breakMinutes = Math.round(manual.reduce((s, p) => s + (p.to - p.from), 0));
+  const elapsedHours = round2(Math.max(0, nowMin - startMin - breakMinutes) / 60);
+  const pauseMinutes = Math.round(auto.reduce((s, p) => s + (p.to - p.from), 0));
+  const onBreak = manual.find((p) => p.ongoing);
   return {
     running: true,
     start: hhmm(startMin),
@@ -659,11 +667,14 @@ function buildWorkday({ start, now, pauses = [], entries = [] }) {
     bookedHours,
     openHours: round2(Math.max(0, elapsedHours - bookedHours)),
     pauseMinutes,
+    breakMinutes,
+    onBreak: onBreak ? hhmm(onBreak.from) : null,
     rangeFrom,
     rangeTo,
     segments,
     gaps: segments.filter((sg) => sg.kind === 'open' && sg.minutes >= 5).map(({ from, to, minutes }) => ({ from, to, minutes })),
-    pauses: pauseIv.map((p) => ({ from: hhmm(p.from), to: p.ongoing ? null : hhmm(p.to), minutes: Math.round(p.to - p.from), kind: p.kind })),
+    pauses: auto.map((p) => ({ from: hhmm(p.from), to: p.ongoing ? null : hhmm(p.to), minutes: Math.round(p.to - p.from), kind: p.kind })),
+    breaks: manual.map((p) => ({ from: hhmm(p.from), to: p.ongoing ? null : hhmm(p.to), minutes: Math.round(p.to - p.from) })),
   };
 }
 

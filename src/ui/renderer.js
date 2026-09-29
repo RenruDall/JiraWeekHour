@@ -82,7 +82,8 @@ function render(s) {
   $('next').textContent = s.nextUpdate;
 
   const w = s.workday;
-  const tip = w && w.running && !s.error ? `${s.tray.tooltip} \u00b7 at work ${fmtMin(w.elapsedHours * 60)}, ${fmtMin(w.openHours * 60)} not booked` : s.tray.tooltip;
+  let tip = s.tray.tooltip;
+  if (w && w.running && !s.error) tip = w.onBreak ? `${tip} \u00b7 on a break since ${w.onBreak}` : `${tip} \u00b7 at work ${fmtMin(w.elapsedHours * 60)}, ${fmtMin(w.openHours * 60)} not booked`;
   drawTrayIcon({ ...s.tray, tooltip: tip });
 
   // After every finished update, reload an older week or the calendar too
@@ -388,7 +389,7 @@ function renderWorkday() {
   const pos = (min) => `${((min - w.rangeFrom) / span) * 100}%`;
   const width = (a, b) => `${((b - a) / span) * 100}%`;
   const segs = w.segments.map((sg) => {
-    const what = sg.kind === 'booked' ? `${sg.key}${sg.summary ? ` ${sg.summary}` : ''}` : (sg.kind === 'pause' ? 'Pause' : 'Not booked');
+    const what = sg.kind === 'booked' ? `${sg.key}${sg.summary ? ` ${sg.summary}` : ''}` : ({ pause: 'Pause (counted)', break: 'Break (not counted)' }[sg.kind] || 'Not booked');
     return `<div class="wd-seg ${sg.kind}" style="left:${pos(sg.fromMin)};width:${width(sg.fromMin, sg.toMin)}" title="${esc(`${sg.from}–${sg.to} ${what} (${fmtMin(sg.minutes)})`)}"></div>`;
   }).join('');
   const nowMin = Number(w.now.slice(0, 2)) * 60 + Number(w.now.slice(3, 5));
@@ -405,12 +406,15 @@ function renderWorkday() {
   const pauses = w.pauses.length
     ? `<div>Pauses (counted as work time): ${w.pauses.map((p) => `<span class="chip pause">${esc(p.from)}–${esc(p.to || 'now')} · ${esc(PAUSE_TEXT[p.kind] || 'pause')}</span>`).join('')}</div>`
     : '';
+  const breaks = w.breaks && w.breaks.length
+    ? `<div>Breaks (not counted): ${w.breaks.map((b) => `<span class="chip brk">${esc(b.from)}\u2013${esc(b.to || 'now')} \u00b7 ${fmtMin(b.minutes)}</span>`).join('')}</div>`
+    : '';
   const openZero = w.openHours <= 0.01;
 
   box.innerHTML = `
     <div class="wd-head">
       <span class="card-title">Work clock</span>
-      <span class="since">At work since <strong>${esc(w.start)}</strong>${w.manual ? ' (set by you)' : ''}</span>
+      <span class="since">At work since <strong>${esc(w.start)}</strong>${w.manual ? ' (set by you)' : ''}${w.onBreak ? ` \u00b7 <strong>on a break since ${esc(w.onBreak)}</strong>` : ''}</span>
     </div>
     <div class="wd-stats">
       <div class="wd-stat"><div class="label">At work</div><div class="value">${fmtMin(w.elapsedHours * 60)}</div></div>
@@ -421,8 +425,8 @@ function renderWorkday() {
       <div class="wd-track" role="img" aria-label="${esc(`Today from ${w.start} to ${w.now}: ${fmtMin(w.bookedHours * 60)} booked, ${fmtMin(w.openHours * 60)} not booked`)}">${segs}<div class="wd-now" style="left:${pos(nowMin)}" title="Now ${esc(w.now)}"></div></div>
       <div class="wd-axis">${ticks}</div>
     </div>
-    <div class="cal-legend"><span><i style="background: var(--green)"></i>Booked</span><span><i style="background: var(--amber)"></i>Not booked</span><span><i style="background: repeating-linear-gradient(45deg, #c9c6bf 0 3px, #e7e5e0 3px 7px)"></i>Pause</span></div>
-    <div class="wd-lists">${gaps}${pauses}</div>
+    <div class="cal-legend"><span><i style="background: var(--green)"></i>Booked</span><span><i style="background: var(--amber)"></i>Not booked</span><span><i style="background: #b9b6ae"></i>Break</span><span><i style="background: repeating-linear-gradient(45deg, #c9c6bf 0 3px, #e7e5e0 3px 7px)"></i>Locked / asleep</span></div>
+    <div class="wd-lists">${gaps}${breaks}${pauses}</div>
     <div class="wd-actions">
       ${w.demo ? '' : '<button type="button" class="btn btn-small" id="wd-jira">Book in Jira</button>'}
       <button type="button" class="link-btn" id="wd-edit">Edit start</button>
@@ -575,6 +579,17 @@ function renderToday(r, s) {
     <div class="since ${s.sinceLast < 0 ? 'down' : ''}">${esc(since)}</div>
     <button class="btn btn-primary btn-block" id="update-btn" type="button" ${s.updating ? 'disabled' : ''}>${s.updating ? 'Updating…' : 'Update now'}</button>`;
   $('update-btn').addEventListener('click', () => jwh.refresh());
+  const w = s.workday;
+  if (w && w.running) {
+    const pause = document.createElement('button');
+    pause.type = 'button';
+    pause.id = 'pause-btn';
+    pause.className = `btn btn-block ${w.onBreak ? 'btn-break' : ''}`;
+    pause.textContent = w.onBreak ? 'Resume work' : 'Pause';
+    pause.title = w.onBreak ? 'End the break; the clock counts again' : 'Start a break (e.g. lunch). Break time is not counted as work time.';
+    pause.addEventListener('click', () => jwh.toggleBreak());
+    $('today').appendChild(pause);
+  }
 }
 
 function renderSide(r, s) {

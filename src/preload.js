@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld('jwh', {
   loadTeam: (weekStart) => ipcRenderer.invoke('load-team', weekStart),
   loadOverdue: (scope) => ipcRenderer.invoke('load-overdue', scope),
   setClockStart: (value) => ipcRenderer.invoke('set-clock-start', value),
+  toggleBreak: () => ipcRenderer.send('toggle-break'),
   openJira: (key) => ipcRenderer.send('open-jira', key),
   exportReport: (kind, weekStart) => ipcRenderer.invoke('export', kind, weekStart),
   setTrayIcon: (dataUrl, tooltip) => ipcRenderer.send('tray-icon', dataUrl, tooltip),

@@ -303,3 +303,9 @@ button { font: inherit; }
 .wd-edit { display: inline-flex; gap: 6px; align-items: center; }
 .wd-edit input { height: 30px; border: 1px solid #cfccc5; border-radius: 6px; padding: 0 8px; font: inherit; }
 .wd-note { font-size: 11px; color: var(--muted); }
+
+.wd-seg.break { background: #b9b6ae; }
+.wd-lists .chip.brk { background: #e4e2dc; color: var(--text); }
+#pause-btn { margin-top: -2px; }
+.btn-break { background: var(--amber-soft); border-color: #f1d49c; color: var(--amber-text); font-weight: 600; }
+.btn-break:hover { background: #f8dfb4; }
