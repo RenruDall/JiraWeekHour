@@ -513,3 +513,40 @@ for (const cloud of [false, true]) {
     }
   });
 }
+
+test('durations: 1 day = one working day', () => {
+  const f = core.formatDuration;
+  assert.strictEqual(f(0), '0h');
+  assert.strictEqual(f(0.25), '15m');
+  assert.strictEqual(f(7.5), '7h 30m');
+  assert.strictEqual(f(9.4), '9h 24m', 'single-day values stay in hours');
+  assert.strictEqual(f(9.4, 8), '1d 1h 24m');
+  assert.strictEqual(f(16, 8), '2d');
+  assert.strictEqual(f(33.3, 8), '4d 1h 18m');
+  assert.strictEqual(f(40, 8), '5d');
+  assert.strictEqual(f(30.1, 7.5), '4d 0h 06m', 'follows the daily target');
+});
+
+test('part time: admins set a working week per person', () => {
+  const settings = core.normalizeSettings({ workWeeks: { tom: [4, 4, 4, 4, 4], sara: [8, 8, 8, 8, 0], broken: [1, 2] } });
+  assert.deepStrictEqual(Object.keys(settings.workWeeks), ['tom', 'sara'], 'broken entries are dropped');
+  assert.throws(() => core.checkWorkWeek([8, 8, 8, 8, 25]), /between 0 and 24/);
+  assert.deepStrictEqual(core.dayTargetsFor(settings, 'anna'), [8, 8, 8, 8, 8], 'everyone else: daily target every day');
+
+  const fri = new Date(2026, 8, 25, 18, 0); // Friday
+  const at = (n) => { const d = new Date(2026, 8, 21 + n); return core.dateKey(d); };
+  const e = (user, n, hours) => ({ id: `${user}${n}`, day: at(n), time: '09:00', key: 'IT-1', summary: '', category: 'S', hours, user, userName: user });
+  const entries = [0, 1, 2, 3, 4].flatMap((n) => [e('tom', n, 4), e('sara', n < 4 ? n : 9, 8), e('anna', n, 8)]).filter((x) => x.day <= at(4));
+  const members = [{ id: 'anna', displayName: 'Anna' }, { id: 'sara', displayName: 'Sara' }, { id: 'tom', displayName: 'Tom' }];
+  const team = core.buildTeamWeek(entries, members, settings, fri);
+  const row = (id) => team.rows.find((r) => r.id === id);
+  assert.strictEqual(row('tom').missing, 0, '4h a day is complete for a 20h week');
+  assert.deepStrictEqual(row('tom').days.slice(0, 5).map((d) => d.status), ['done', 'done', 'done', 'done', 'done']);
+  assert.strictEqual(row('tom').weekHours, 20);
+  assert.ok(row('tom').partTime);
+  assert.strictEqual(row('sara').days[4].status, 'off', 'Friday off');
+  assert.strictEqual(row('sara').missing, 0);
+  assert.strictEqual(row('tom').report.weekTarget, 20);
+  assert.strictEqual(team.totals.workingToday, 2, 'Sara is off on Friday');
+  assert.strictEqual(team.totals.onTargetToday, 2);
+});

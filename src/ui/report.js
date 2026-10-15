@@ -5,8 +5,21 @@
   const SERIES = ['var(--series-1)', 'var(--series-2)', 'var(--series-3)', 'var(--series-4)', 'var(--series-5)', 'var(--series-6)', 'var(--series-7)'];
   const OTHER = 'var(--series-other)';
   const esc = (v) => String(v === undefined || v === null ? '' : v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const h2 = (n) => `${Number(n).toFixed(2)}h`;
-  const h1 = (n) => `${Number(n).toFixed(1)}h`;
+  // Durations as "2d 3h 05m": 1d = one working day (the daily target); hm() for single-day values
+  let dayHours = 8;
+  function fmtDur(hours, dh) {
+    let min = Math.round(Math.max(0, Number(hours) || 0) * 60);
+    if (!min) return '0h';
+    const dayMin = dh > 0 ? Math.round(dh * 60) : 0;
+    const d = dayMin ? Math.floor(min / dayMin) : 0;
+    min -= d * dayMin;
+    const h = Math.floor(min / 60);
+    const m = String(min % 60).padStart(2, '0');
+    if (d) return h || min % 60 ? `${d}d ${h}h ${m}m` : `${d}d`;
+    return h ? `${h}h ${m}m` : `${min % 60}m`;
+  }
+  const hm = (n) => fmtDur(n, 0);
+  const dhm = (n) => fmtDur(n, dayHours);
   const clip = (text, max) => (String(text).length > max ? `${String(text).slice(0, max - 1)}…` : String(text));
 
   // Rectangle with rounded top corners only (data end), square at the baseline
@@ -73,7 +86,7 @@
           : `<rect x="${x}" y="${y1}" width="${barW}" height="${h}" fill="${colour}"/>`;
         base += g.hours;
       });
-      if (d.total > 0) svg += `<text class="val" x="${cx}" y="${y(d.total) - 5}" text-anchor="middle">${esc(h1(d.total))}</text>`;
+      if (d.total > 0) svg += `<text class="val" x="${cx}" y="${y(d.total) - 5}" text-anchor="middle">${esc(hm(d.total))}</text>`;
       svg += `<text class="tick" x="${cx}" y="${H - bottom + 16}" text-anchor="middle">${esc(d.label)}</text>`;
     });
     // Daily target
@@ -84,7 +97,7 @@
 
   // Horizontal bars, one colour (a single series needs no legend)
   function barChart(rows, width, labelWidth, ariaLabel) {
-    const rowH = 30; const barH = 14; const top = 4; const right = 52;
+    const rowH = 30; const barH = 14; const top = 4; const right = 76;
     const H = top + rows.length * rowH + 4;
     const plotW = width - labelWidth - right;
     const max = Math.max(...rows.map((r) => r.hours), 0.01);
@@ -96,7 +109,7 @@
       svg += `<text class="lbl" x="${labelWidth - 8}" y="${r.sub ? yMid - 2 : yMid + 4}" text-anchor="end">${esc(r.label)}</text>`;
       if (r.sub) svg += `<text class="lbl-sub" x="${labelWidth - 8}" y="${yMid + 10}" text-anchor="end">${esc(r.sub)}</text>`;
       svg += `<path d="${rightRounded(labelWidth, yMid - barH / 2, w, barH, 4)}" fill="${r.colour || 'var(--series-1)'}"/>`;
-      svg += `<text class="val" x="${labelWidth + w + 6}" y="${yMid + 4}">${esc(h2(r.hours))}</text>`;
+      svg += `<text class="val" x="${labelWidth + w + 6}" y="${yMid + 4}">${esc(dhm(r.hours))}</text>`;
     });
     return `${svg}</svg>`;
   }
@@ -120,14 +133,14 @@
       const info = report.days.find((d) => d.date === day);
       const total = items.reduce((sum, e) => sum + e.hours, 0);
       // one <tbody> per day keeps a day's rows together across page breaks
-      bodies += `<tbody class="day"><tr class="day-row"><td colspan="4">${esc(info ? info.label : day)}</td><td class="num">${esc(h2(total))}</td></tr>`;
+      bodies += `<tbody class="day"><tr class="day-row"><td colspan="4">${esc(info ? info.label : day)}</td><td class="num">${esc(hm(total))}</td></tr>`;
       for (const e of items) {
         bodies += `<tr>
           <td class="mono">${esc(e.time || '')}</td>
           <td class="mono">${esc(e.key)}</td>
           <td>${esc(e.summary)}${e.comment ? `<span class="cmt">${esc(e.comment)}</span>` : ''}</td>
           <td>${esc(e.category)}</td>
-          <td class="num">${esc(h2(e.hours))}</td>
+          <td class="num">${esc(hm(e.hours))}</td>
         </tr>`;
       }
       bodies += '</tbody>';
@@ -135,12 +148,13 @@
     return `<table>
       <thead><tr><th>Start</th><th>Ticket</th><th>Summary / comment</th><th>${esc(report.groupLabel)}</th><th class="num">Hours</th></tr></thead>
       ${bodies}
-      <tbody><tr class="day-row total-row"><td colspan="4">Week total</td><td class="num">${esc(h2(report.weekTotal))}</td></tr></tbody>
+      <tbody><tr class="day-row total-row"><td colspan="4">Week total</td><td class="num">${esc(dhm(report.weekTotal))}</td></tr></tbody>
     </table>`;
   }
 
   window.renderReport = function renderReport(data) {
     const report = { ...data.report, groupLabel: data.groupLabel };
+    dayHours = report.target || 8;
     const colours = colourMap(report.categories);
     const workdays = report.days.filter((d) => d.isWorkday && !d.isFuture);
     const onTarget = workdays.filter((d) => d.total >= report.target).length;
@@ -159,13 +173,13 @@
           <h1>Week ${esc(report.weekNumber)} · ${esc(report.weekLabel)}</h1>
           <div class="sub">${esc(report.me.displayName)}${report.demo ? ' · demo data' : ''}</div>
         </div>
-        <div class="meta">Jira Week Hours<br>Created ${esc(createdText)}</div>
+        <div class="meta">Jira Week Hours by Michael Ladurner<br>Created ${esc(createdText)}</div>
       </header>
 
       <div class="tiles">
-        <div class="tile"><div class="label">Hours logged</div><div class="value">${esc(h2(report.weekTotal))} <small>of ${esc(report.weekTarget)}h</small></div></div>
+        <div class="tile"><div class="label">Hours logged</div><div class="value">${esc(dhm(report.weekTotal))} <small>of ${esc(dhm(report.weekTarget))}</small></div></div>
         <div class="tile"><div class="label">Workdays on target</div><div class="value ${workdays.length && onTarget === workdays.length ? 'good' : ''}">${onTarget} <small>of ${workdays.length}</small></div></div>
-        <div class="tile"><div class="label">Hours missing</div><div class="value ${missing > 0 ? 'warn' : 'good'}">${esc(h2(missing))}</div></div>
+        <div class="tile"><div class="label">Hours missing</div><div class="value ${missing > 0 ? 'warn' : 'good'}">${esc(dhm(missing))}</div></div>
       </div>
 
       <section class="chart">

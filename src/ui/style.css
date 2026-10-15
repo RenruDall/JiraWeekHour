@@ -65,7 +65,7 @@ button { font: inherit; }
 
 /* Calendar */
 .calendar { overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
-.cal-head, .cal-week { display: grid; grid-template-columns: 44px repeat(7, minmax(0, 1fr)) 64px; gap: 4px; align-items: stretch; }
+.cal-head, .cal-week { display: grid; grid-template-columns: 44px repeat(7, minmax(0, 1fr)) 84px; gap: 4px; align-items: stretch; }
 .cal-head div { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); text-align: center; padding-bottom: 2px; }
 .cal-weeks { display: flex; flex-direction: column; gap: 4px; }
 .cal-week { width: 100%; padding: 3px; border: 1px solid transparent; border-radius: 9px; background: transparent; cursor: pointer; font: inherit; color: inherit; }
@@ -82,7 +82,7 @@ button { font: inherit; }
 .cal-day.partial .hrs { color: var(--amber-text); }
 .cal-day.missing { background: var(--red-soft); }
 .cal-day.missing .hrs { color: #8e2019; }
-.cal-day.weekend, .cal-day.weekend-logged { background: transparent; border: 1px dashed var(--line); }
+.cal-day.weekend, .cal-day.weekend-logged, .cal-day.off { background: transparent; border: 1px dashed var(--line); }
 .cal-day.future { background: transparent; border: 1px solid var(--line-soft); }
 .cal-day.out { opacity: 0.4; }
 .cal-day.today { box-shadow: inset 0 0 0 2px var(--text); }
@@ -130,7 +130,7 @@ button { font: inherit; }
 .pill.missing { color: var(--amber-text); background: var(--amber-soft); }
 .pill.done { color: var(--green-text); background: var(--green-soft); }
 .pill.none { visibility: hidden; }
-.tickets { display: grid; grid-template-columns: 100px minmax(0, 1fr) 52px; gap: 2px 10px; font-size: 12px; color: var(--text-2); padding-left: 92px; }
+.tickets { display: grid; grid-template-columns: 100px minmax(0, 1fr) 60px; gap: 2px 10px; font-size: 12px; color: var(--text-2); padding-left: 92px; }
 .tickets .group-name { grid-column: 1 / 3; font-weight: 600; color: var(--text); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tickets .group-name:first-child { margin-top: 0; }
 .tickets .group-hrs { text-align: right; font-family: var(--mono); font-weight: 600; color: var(--text); margin-top: 4px; }
@@ -169,7 +169,7 @@ button { font: inherit; }
 .thin-bar { height: 8px; background: var(--line-soft); border-radius: 4px; overflow: hidden; margin: 8px 0; }
 .thin-bar > div { height: 100%; background: var(--blue); border-radius: 4px; }
 .note { font-size: 12px; color: var(--muted); }
-.cats { display: grid; grid-template-columns: 76px minmax(0, 1fr) 56px; gap: 8px; align-items: center; font-size: 12px; margin-top: 8px; }
+.cats { display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: 12px; margin-top: 8px; }
 .cats .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cats .mini { height: 6px; background: var(--line-soft); border-radius: 3px; overflow: hidden; }
 .cats .mini > div { height: 100%; background: var(--blue); }
@@ -239,7 +239,7 @@ button { font: inherit; }
 .team-tile .value { font-size: 20px; font-weight: 600; }
 .team-tile .value small { font-size: 12px; font-weight: 400; color: var(--muted); }
 .team-grid { display: flex; flex-direction: column; gap: 4px; }
-.tg-head, .tg-row { display: grid; grid-template-columns: minmax(110px, 1.4fr) repeat(5, minmax(0, 1fr)) 60px 60px; gap: 4px; align-items: stretch; }
+.tg-head, .tg-row { display: grid; grid-template-columns: minmax(110px, 1.4fr) repeat(5, minmax(0, 1fr)) 76px 76px; gap: 4px; align-items: stretch; }
 .tg-head div { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); text-align: center; }
 .tg-head div:first-child { text-align: left; }
 .tg-row { width: 100%; padding: 3px; border: 1px solid transparent; border-radius: 9px; background: transparent; cursor: pointer; font: inherit; color: inherit; text-align: left; }
@@ -333,3 +333,15 @@ button { font: inherit; }
 .mp-item:hover { background: #f6f5f2; }
 .mp-foot { display: flex; gap: 8px; align-items: center; justify-content: flex-end; border-top: 1px solid var(--line-soft); padding-top: 8px; }
 .mp-foot .muted { margin-right: auto; font-size: 12px; }
+
+/* Durations like "1d 5h 30m" stay on one line */
+.cats .hrs, .tg-num, .cal-total, .day-hours, .tickets .hrs, .tickets .group-hrs, .stat-row .val, .team-tile .value { white-space: nowrap; }
+
+/* Team: working week per person */
+.off-swatch { background: transparent !important; border: 1px dashed var(--muted); box-sizing: border-box; }
+.ww { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--line-soft); padding-top: 8px; }
+.ww-days { display: flex; gap: 8px; flex-wrap: wrap; }
+.ww-days label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--muted); }
+.ww-days input { width: 62px; height: 30px; border: 1px solid #cfccc5; border-radius: 6px; padding: 0 6px; font: inherit; font-size: 13px; background: #fff; }
+.ww-foot { display: flex; gap: 10px; align-items: center; }
+.ww-foot .muted { margin-right: auto; }

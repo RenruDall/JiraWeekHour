@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('jwh', {
   searchUsers: (query) => ipcRenderer.invoke('search-users', query),
   teamCandidates: () => ipcRenderer.invoke('team-candidates'),
   setTeamMembers: (list) => ipcRenderer.invoke('set-team-members', list),
+  setWorkWeek: (memberId, hours) => ipcRenderer.invoke('set-work-week', memberId, hours),
   openJira: (key) => ipcRenderer.send('open-jira', key),
   exportReport: (kind, weekStart) => ipcRenderer.invoke('export', kind, weekStart),
   setTrayIcon: (dataUrl, tooltip) => ipcRenderer.send('tray-icon', dataUrl, tooltip),

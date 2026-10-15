@@ -55,7 +55,7 @@ Some single sign-on providers (Google in particular) refuse sign-in from embedde
 
 | Setting | Default | Notes |
 |---|---|---|
-| Daily target | 8 h | Monday to Friday |
+| Daily target | 8 h | Monday to Friday. Also the length of a day in durations: totals over several days show as `2d 3h 15m`, where 1d = one working day; single days show as `7h 30m` |
 | Update every | 1 hour | Off, 15 min, 30 min, 1 h, 2 h or 4 h - quiet background update |
 | Reminder times | 12:00, 16:00 | Update + notification if hours are missing, e.g. `10:00, 12:00, 16:00` |
 | Task counts as overdue after | 3 days | Unresolved tasks more than this many days past their due date |
@@ -88,6 +88,8 @@ Both are read from Jira's own project settings (*Project settings › People*) w
 In the Team tab, **Members** opens the member list: search people in Jira by name (at least 2 letters), tick the ones you want, and click **Apply**. The list is saved. While nobody is picked, the dashboard shows the **team group** if one is set.
 
 ![Member list](docs/members.png)
+
+**Part time:** click a name in the Team tab and set their **working week**, the hours for Monday to Friday (e.g. 4h every day, or 0 on a free Friday). The day colours then follow that person's own hours: green when their target for the day is reached, a dashed box on their days off. The working week is saved on the admin's PC only.
 
 **No Team tab?** Ask a Jira administrator to make you project lead or add you to a project's Administrators role under *Project settings › People*, then restart the app.
 
@@ -162,4 +164,6 @@ forge.config.js    Electron Forge: Setup.exe
 
 ## License
 
-[MIT](LICENSE)
+Created by **Michael Ladurner** ([@Mengokai](https://github.com/Mengokai)).
+
+Licensed under the [Apache License 2.0](LICENSE). You may use, change and share it, including commercially. If you distribute it or a modified version, keep the [NOTICE](NOTICE) file with the attribution and mark the files you changed.

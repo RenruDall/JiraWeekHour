@@ -1,11 +1,11 @@
 {
   "name": "jira-week-hours",
   "productName": "Jira Week Hours",
-  "version": "1.4.3",
+  "version": "1.6.0",
   "description": "Tray app that shows how many hours you still need to log in Jira today, and your week by day and sprint.",
   "main": "src/main.js",
   "author": "Michael Ladurner",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "private": true,
   "scripts": {
     "start": "electron-forge start",

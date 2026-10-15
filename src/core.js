@@ -100,10 +100,37 @@ function normalizeSettings(raw) {
     .filter((m, i, all) => all.findIndex((x) => x.id === m.id) === i)
     .slice(0, 60);
 
+  const workWeeks = normalizeWorkWeeks(s.workWeeks);
+
   return {
     baseUrl, auth, email, targetHours, categoryField, refreshTimes, autoRefreshMinutes, overdueDays, adminGroup, teamGroup,
-    lunchStart: lunch.start, lunchEnd: lunch.end, lunchOverrides, teamMembers, demo: !!s.demo,
+    lunchStart: lunch.start, lunchEnd: lunch.end, lunchOverrides, teamMembers, workWeeks, demo: !!s.demo,
   };
+}
+
+// Working week per team member, set by the admin: hours for Monday..Friday, e.g. [8, 8, 8, 8, 0]
+function checkWorkWeek(list, who = 'The working week') {
+  if (!Array.isArray(list) || list.length !== 5) throw new Error(`${who} needs hours for Monday to Friday.`);
+  return list.map((v) => {
+    const n = Number(v);
+    if (!(Number.isFinite(n) && n >= 0 && n <= 24)) throw new Error(`${who}: each day must be between 0 and 24 hours.`);
+    return Math.round(n * 100) / 100;
+  });
+}
+
+function normalizeWorkWeeks(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const id of Object.keys(raw).slice(0, 200)) {
+    try { out[String(id)] = checkWorkWeek(raw[id]); } catch { /* skip a broken entry */ }
+  }
+  return out;
+}
+
+// Monday..Friday targets for one person: their own working week, or the daily target every day
+function dayTargetsFor(settings, memberId) {
+  const own = settings.workWeeks && settings.workWeeks[memberId];
+  return own ? own.slice() : [0, 1, 2, 3, 4].map(() => settings.targetHours);
 }
 
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -546,6 +573,7 @@ function buildReport(entries, me, settings, now, opts = {}) {
   const week = weekOf(opts.weekDate || now);
   const current = weekOf(now);
   const target = settings.targetHours;
+  const dayTargets = Array.isArray(opts.dayTargets) && opts.dayTargets.length === 5 ? opts.dayTargets : null;
   const todayKey = dateKey(current.today);
   const weekEntries = entries.filter((e) => e.day >= week.from && e.day <= week.to);
 
@@ -574,8 +602,9 @@ function buildReport(entries, me, settings, now, opts = {}) {
     const isToday = key === todayKey;
     const isWorkday = i < 5 || (isToday && opts.forceWorkday);
     const isFuture = key > todayKey;
-    const missing = isWorkday && !isFuture && total < target ? round2(target - total) : 0;
-    return { date: key, label: dayLabel(d), isToday, isWorkday, isFuture, total, missing, tickets, groups, visible: isWorkday || total > 0 };
+    const dayTarget = dayTargets && i < 5 ? dayTargets[i] : target;
+    const missing = isWorkday && !isFuture && total < dayTarget ? round2(dayTarget - total) : 0;
+    return { date: key, label: dayLabel(d), isToday, isWorkday, isFuture, target: isWorkday ? dayTarget : 0, total, missing, tickets, groups, visible: isWorkday || total > 0 };
   });
 
   const sumBy = (field) => {
@@ -614,7 +643,7 @@ function buildReport(entries, me, settings, now, opts = {}) {
       isWeekend: !todayIsWorkday,
     } : null,
     weekTotal: round2(days.reduce((sum, d) => sum + d.total, 0)),
-    weekTarget: target * 5,
+    weekTarget: dayTargets ? round2(dayTargets.reduce((a, b) => a + b, 0)) : target * 5,
     categories: sumBy('category').map(({ name, hours }) => ({ name, hours })),
     tickets: sumBy('key').map(({ name, hours, summary, category }) => ({ key: name, hours, summary, category })),
     missingDays: days.filter((d) => d.missing > 0).map((d) => ({ label: d.label, missing: d.missing })),
@@ -678,20 +707,28 @@ function buildTeamWeek(entries, members, settings, now, opts = {}) {
 
   const rows = list.map((m) => {
     const mine = entries.filter((e) => e.user === m.id && e.day >= week.from && e.day <= week.to);
-    const report = buildReport(mine, { displayName: m.displayName }, settings, now, { weekDate: week.days[0] });
+    const dayTargets = dayTargetsFor(settings, m.id);
+    const report = buildReport(mine, { displayName: m.displayName }, settings, now, { weekDate: week.days[0], dayTargets });
     const days = report.days.map((d, i) => {
       const isWorkday = i < 5;
+      const target = isWorkday ? dayTargets[i] : 0;
       let status;
-      if (d.isFuture) status = 'future';
+      if (d.isFuture) status = target > 0 ? 'future' : 'off';
       else if (!isWorkday) status = d.total > 0 ? 'weekend-logged' : 'weekend';
-      else if (d.total >= settings.targetHours) status = 'done';
+      else if (target === 0) status = 'off'; // not a working day for this person
+      else if (d.total >= target) status = 'done';
       else if (d.total > 0) status = 'partial';
       else status = 'missing';
-      return { date: d.date, total: d.total, status, isToday: d.date === todayKey };
+      return { date: d.date, total: d.total, target, status, isToday: d.date === todayKey };
     });
+    const weekHours = round2(dayTargets.reduce((a, b) => a + b, 0));
     return {
       id: m.id,
       displayName: m.displayName,
+      dayTargets,
+      weekHours,
+      partTime: !!(settings.workWeeks && settings.workWeeks[m.id]) && weekHours < settings.targetHours * 5,
+      customWeek: !!(settings.workWeeks && settings.workWeeks[m.id]),
       days,
       total: report.weekTotal,
       missing: round2(report.missingDays.reduce((s, d) => s + d.missing, 0)),
@@ -713,7 +750,9 @@ function buildTeamWeek(entries, members, settings, now, opts = {}) {
     totals: {
       hours: round2(rows.reduce((s, r) => s + r.total, 0)),
       missing: round2(rows.reduce((s, r) => s + r.missing, 0)),
-      onTargetToday: isCurrent ? rows.filter((r) => r.today && r.today.total >= settings.targetHours).length : null,
+      // only people who work today count: "2 of 4" when one of five has the day off
+      onTargetToday: isCurrent ? rows.filter((r) => r.today && r.today.target > 0 && r.today.total >= r.today.target).length : null,
+      workingToday: isCurrent ? rows.filter((r) => r.today && r.today.target > 0).length : null,
       members: rows.length,
     },
   };
@@ -802,6 +841,20 @@ function buildWorkday({ start, now, lunch = null, bookedHours = 0, targetHours =
   };
 }
 
+// Durations as "2d 3h 05m", where 1d = one working day (the daily target, e.g. 8h).
+// Without dayHours (or for single-day values) it stays in hours: "7h 30m".
+function formatDuration(hours, dayHours = 0) {
+  let min = Math.round(Math.max(0, Number(hours) || 0) * 60);
+  if (!min) return '0h';
+  const dayMin = dayHours > 0 ? Math.round(dayHours * 60) : 0;
+  const d = dayMin ? Math.floor(min / dayMin) : 0;
+  min -= d * dayMin;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  if (d) return h || m ? `${d}d ${h}h ${pad(m)}m` : `${d}d`;
+  return h ? `${h}h ${pad(m)}m` : `${m}m`;
+}
+
 const formatMinutes = (min) => {
   const m = Math.max(0, Math.round(min));
   return m >= 60 ? `${Math.floor(m / 60)}h ${pad(m % 60)}m` : `${m}m`;
@@ -818,9 +871,9 @@ function trayInfo(report, error) {
   if (error) return { text: '!', color: 'red', tooltip: 'Jira hours: not reachable - click for details' };
   if (!report || !report.today) return { text: '\u2026', color: 'gray', tooltip: 'Jira hours: loading\u2026' };
   const t = report.today;
-  if (t.isWeekend) return { text: '\u2013', color: 'gray', tooltip: `Jira hours: weekend (${t.logged.toFixed(1)}h logged)` };
-  if (t.missing <= 0) return { text: 'check', color: 'green', tooltip: `Jira hours: ${t.logged.toFixed(1)}h logged - done for today` };
-  return { text: formatRemaining(t.missing), color: 'amber', tooltip: `Jira hours: ${t.logged.toFixed(1)}h logged - ${t.missing.toFixed(1)}h remaining` };
+  if (t.isWeekend) return { text: '\u2013', color: 'gray', tooltip: `Jira hours: weekend (${formatDuration(t.logged)} logged)` };
+  if (t.missing <= 0) return { text: 'check', color: 'green', tooltip: `Jira hours: ${formatDuration(t.logged)} logged - done for today` };
+  return { text: formatRemaining(t.missing), color: 'amber', tooltip: `Jira hours: ${formatDuration(t.logged)} logged - ${formatDuration(t.missing)} remaining` };
 }
 
 // -------------------------------------------------------------------- export
@@ -987,5 +1040,5 @@ module.exports = {
   DEFAULTS, REFRESH_CHOICES, JiraError, cleanBaseUrl, normalizeSettings, weekOf, dateKey, parseDateKey, isoWeek, monthGrid,
   nextUpdateText, fieldText, sprintText, commentText, makeJsonFetcher, detectDeployment, connect, loadEntriesRange,
   loadReport, buildReport, buildMonth, trayInfo, formatRemaining, exportCsv, demoEntries, demoReport, demoMonth,
-  pickClockStart, buildWorkday, formatMinutes, lunchFor, checkLunch, isAdminOf, adminReasons, searchUsers, asMember, userKey, jqlString, loadGroupMembers, loadOverdue, overdueItems, buildTeamWeek, demoTeamWeek, demoOverdue, demoMembers, demoSearchUsers, DEMO_TEAM,
+  checkWorkWeek, dayTargetsFor, pickClockStart, buildWorkday, formatMinutes, formatDuration, lunchFor, checkLunch, isAdminOf, adminReasons, searchUsers, asMember, userKey, jqlString, loadGroupMembers, loadOverdue, overdueItems, buildTeamWeek, demoTeamWeek, demoOverdue, demoMembers, demoSearchUsers, DEMO_TEAM,
 };

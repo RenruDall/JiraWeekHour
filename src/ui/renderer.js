@@ -3,8 +3,20 @@
 
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const h2 = (n) => `${Number(n).toFixed(2)}h`;
-const h1 = (n) => `${Number(n).toFixed(1)}h`;
+// Durations as "2d 3h 05m": 1d = one working day (the daily target). hm() for single-day values.
+function fmtDur(hours, dayHours) {
+  let min = Math.round(Math.max(0, Number(hours) || 0) * 60);
+  if (!min) return '0h';
+  const dayMin = dayHours > 0 ? Math.round(dayHours * 60) : 0;
+  const d = dayMin ? Math.floor(min / dayMin) : 0;
+  min -= d * dayMin;
+  const h = Math.floor(min / 60);
+  const m = String(min % 60).padStart(2, '0');
+  if (d) return h || min % 60 ? `${d}d ${h}h ${m}m` : `${d}d`;
+  return h ? `${h}h ${m}m` : `${min % 60}m`;
+}
+const hm = (n) => fmtDur(n, 0);
+const dhm = (n) => fmtDur(n, (current && current.settings && current.settings.targetHours) || 8);
 const pct = (v, max) => `${Math.max(0, Math.min(100, max > 0 ? (v / max) * 100 : 0))}%`;
 const hostOf = (url) => { try { return new URL(url).host; } catch { return ''; } };
 const time = (iso) => { const d = new Date(iso); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
@@ -100,6 +112,7 @@ function render(s) {
     firstRender = false;
     if (s.startView === 'past') navigate(-1).then(() => jwh.rendered());
     else if (s.startView === 'members') switchTab('team').then(openPicker).then(() => { pk.draft.set('demo-anna', { id: 'demo-anna', jql: 'aberger', displayName: 'Anna Berger' }); renderPickerList(); jwh.rendered(); });
+    else if (s.startView === 'workweek') switchTab('team').then(() => { view.expanded = 'demo-tom'; renderTeam(view.team); $('ww-form').scrollIntoView({ block: 'center' }); jwh.rendered(); });
     else if (s.startView === 'settings') { openSettings(); document.querySelector('.lunch-day').open = true; document.querySelector('.lunch-fields').scrollIntoView(); jwh.rendered(); }
     else if (s.startView && s.startView !== 'week') switchTab(s.startView).then(() => jwh.rendered());
     else jwh.rendered();
@@ -148,7 +161,7 @@ function renderMain() {
     const label = dateOf(`${m.year}-${pad2(m.month + 1)}-01`).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
     const isNow = m.year === new Date().getFullYear() && m.month === new Date().getMonth();
     $('nav-title').textContent = label;
-    $('range').textContent = view.monthData ? `${h2(view.monthData.monthTotal)} logged` : '';
+    $('range').textContent = view.monthData ? `${dhm(view.monthData.monthTotal)} logged` : '';
     $('nav-prev').setAttribute('aria-label', 'Previous month');
     $('nav-next').setAttribute('aria-label', 'Next month');
     $('nav-next').disabled = isNow;
@@ -279,26 +292,26 @@ function renderWeek(r) {
   $('days').innerHTML = r.days.filter((d) => d.visible).map((d) => {
     const done = d.isWorkday && d.total >= r.target;
     let pill = '<span class="pill none">-</span>';
-    if (d.missing > 0) pill = `<span class="pill missing">\u2212${h2(d.missing)}</span>`;
+    if (d.missing > 0) pill = `<span class="pill missing">\u2212${hm(d.missing)}</span>`;
     else if (done) pill = '<span class="pill done">done</span>';
 
     // Grouped by sprint (or the chosen category): a subtotal line, then its tickets
     const tickets = d.groups.length
       ? `<div class="tickets">${d.groups.map((g) => `
           <div class="group-name" title="${esc(g.name)}">${esc(g.name)}</div>
-          <div class="group-hrs">${h2(g.hours)}</div>
+          <div class="group-hrs">${hm(g.hours)}</div>
           ${g.tickets.map((t) => `
           <div class="key">${esc(t.key)}</div>
           <div class="sum" title="${esc(t.summary)}">${esc(t.summary)}</div>
-          <div class="hrs">${h2(t.hours)}</div>`).join('')}`).join('')}</div>`
+          <div class="hrs">${hm(t.hours)}</div>`).join('')}`).join('')}</div>`
       : (d.isFuture ? '' : '<div class="no-tickets">Nothing logged</div>');
 
     const classes = ['day', d.isToday ? 'is-today' : '', d.isToday && done ? 'done' : '', d.isFuture ? 'future' : ''].join(' ');
     return `<div class="${classes}">
       <div class="day-row">
         <div class="day-name">${esc(d.label)}</div>
-        <div class="bar ${done ? 'done' : ''}" role="img" aria-label="${esc(h2(d.total))} of ${esc(r.target)}h"><div style="width:${pct(d.total, r.target)}"></div></div>
-        <div class="day-hours">${h2(d.total)}</div>
+        <div class="bar ${done ? 'done' : ''}" role="img" aria-label="${esc(hm(d.total))} of ${esc(r.target)}h"><div style="width:${pct(d.total, r.target)}"></div></div>
+        <div class="day-hours">${hm(d.total)}</div>
         ${pill}
       </div>
       ${tickets}
@@ -316,15 +329,15 @@ function renderCalendar(m) {
     <div class="cal-weeks">
       ${m.weeks.map((w) => `
         <button type="button" class="cal-week ${w.weekStart === selected ? 'selected' : ''}" data-week="${esc(w.weekStart)}"
-          aria-label="Week ${w.weekNumber}, ${esc(h2(w.total))} logged. Open week"
+          aria-label="Week ${w.weekNumber}, ${esc(dhm(w.total))} logged. Open week"
           ${w.weekStart > currentWeekStart() ? 'disabled' : ''}>
           <span class="cal-wk">${w.weekNumber}</span>
           ${w.days.map((d) => `
-            <span class="cal-day ${d.status} ${d.inMonth ? '' : 'out'} ${d.isToday ? 'today' : ''}" title="${esc(`${d.date}: ${h2(d.total)} ${STATUS_TEXT[d.status] ? `(${STATUS_TEXT[d.status]})` : ''}`)}">
+            <span class="cal-day ${d.status} ${d.inMonth ? '' : 'out'} ${d.isToday ? 'today' : ''}" title="${esc(`${d.date}: ${hm(d.total)} ${STATUS_TEXT[d.status] ? `(${STATUS_TEXT[d.status]})` : ''}`)}">
               <span class="num">${d.day}</span>
-              <span class="hrs">${d.total > 0 ? esc(h1(d.total)) : (d.status === 'missing' ? '0h' : '')}</span>
+              <span class="hrs">${d.total > 0 ? esc(hm(d.total)) : (d.status === 'missing' ? '0h' : '')}</span>
             </span>`).join('')}
-          <span class="cal-total">${w.total > 0 ? esc(h1(w.total)) : ''}</span>
+          <span class="cal-total">${w.total > 0 ? esc(dhm(w.total)) : ''}</span>
         </button>`).join('')}
     </div>
     <div class="cal-legend">
@@ -353,11 +366,11 @@ function renderLog(r) {
     const info = r.days.find((d) => d.date === day);
     const total = items.reduce((sum, e) => sum + e.hours, 0);
     return `<section class="log-day">
-      <h3>${esc(info ? info.label : day)}<span>${h2(total)}</span></h3>
+      <h3>${esc(info ? info.label : day)}<span>${hm(total)}</span></h3>
       ${items.map((e) => `
         <div class="log-row">
           <span class="t">${esc(e.time || '')}</span>
-          <span class="d">${h2(e.hours)}</span>
+          <span class="d">${hm(e.hours)}</span>
           <span class="k">${esc(e.key)}</span>
           <span class="what">
             <span class="sum" title="${esc(e.summary)}">${esc(e.summary)}</span>
@@ -525,8 +538,8 @@ function renderTeam(t) {
   const onTarget = t.totals.onTargetToday;
   const od = view.teamOverdue;
   const tiles = `<div class="team-tiles">
-    <div class="team-tile"><div class="label">Team hours</div><div class="value">${esc(h1(t.totals.hours))} <small>${t.totals.members} people</small></div></div>
-    <div class="team-tile"><div class="label">${onTarget === null ? 'Hours missing' : 'On target today'}</div><div class="value">${onTarget === null ? esc(h1(t.totals.missing)) : `${onTarget} <small>of ${t.totals.members}</small>`}</div></div>
+    <div class="team-tile"><div class="label">Team hours</div><div class="value">${esc(dhm(t.totals.hours))} <small>${t.totals.members} people</small></div></div>
+    <div class="team-tile"><div class="label">${onTarget === null ? 'Hours missing' : 'On target today'}</div><div class="value">${onTarget === null ? esc(dhm(t.totals.missing)) : `${onTarget} <small>of ${t.totals.workingToday ?? t.totals.members}</small>`}</div></div>
     <div class="team-tile"><div class="label">Overdue tasks</div><div class="value">${od && od.items ? od.items.length : '–'} <small>&gt; ${days} days</small></div></div>
   </div>`;
   const notice = t.membersKnown ? '' : `<div class="notice">Jira does not allow listing the members of \u201c${esc(current.settings.teamGroup)}\u201d with your account, so only people who logged time in this week are shown. Pick people under <strong>Members</strong> instead.</div>`;
@@ -536,15 +549,16 @@ function renderTeam(t) {
   const rows = t.rows.length ? t.rows.map((r) => {
     const open = view.expanded === r.id;
     const detail = open ? `<div class="tg-detail">
-        <div><h4>By ${groupWord}</h4>${r.report.categories.map((c) => `<div class="line"><span>${esc(c.name)}</span><span>${esc(h2(c.hours))}</span></div>`).join('') || '<div class="note">Nothing logged</div>'}</div>
-        <div><h4>Tickets</h4>${r.report.tickets.slice(0, 8).map((k) => `<div class="line"><span>${esc(k.key)} ${esc(k.summary)}</span><span>${esc(h2(k.hours))}</span></div>`).join('') || '<div class="note">Nothing logged</div>'}</div>
+        <div><h4>By ${groupWord}</h4>${r.report.categories.map((c) => `<div class="line"><span>${esc(c.name)}</span><span>${esc(dhm(c.hours))}</span></div>`).join('') || '<div class="note">Nothing logged</div>'}</div>
+        <div><h4>Tickets</h4>${r.report.tickets.slice(0, 8).map((k) => `<div class="line"><span>${esc(k.key)} ${esc(k.summary)}</span><span>${esc(dhm(k.hours))}</span></div>`).join('') || '<div class="note">Nothing logged</div>'}</div>
+        ${workWeekEditor(r)}
       </div>` : '';
-    const cells = r.days.slice(0, 5).map((d) => `<span class="cal-day ${d.status} ${d.isToday ? 'today' : ''}" title="${esc(`${r.displayName}, ${d.date}: ${h2(d.total)}`)}"><span class="hrs">${d.total > 0 ? esc(h1(d.total)) : (d.status === 'missing' ? '0h' : '')}</span></span>`).join('');
+    const cells = r.days.slice(0, 5).map((d) => `<span class="cal-day ${d.status} ${d.isToday ? 'today' : ''}" title="${esc(`${r.displayName}, ${d.date}: ${hm(d.total)}${d.target > 0 ? ` of ${hm(d.target)}` : ' (day off)'}`)}"><span class="hrs">${d.total > 0 ? esc(hm(d.total)) : (d.status === 'missing' ? '0h' : '')}</span></span>`).join('');
     return `<button type="button" class="tg-row" data-member="${esc(r.id)}" aria-expanded="${open}">
         <span class="tg-name"><span>${esc(r.displayName)}</span></span>
         ${cells}
-        <span class="tg-num">${esc(h1(r.total))}</span>
-        <span class="tg-num ${r.missing > 0 ? 'miss' : 'ok'}">${r.missing > 0 ? esc(h1(r.missing)) : '✓'}</span>
+        <span class="tg-num">${esc(dhm(r.total))}</span>
+        <span class="tg-num ${r.missing > 0 ? 'miss' : 'ok'}">${r.missing > 0 ? esc(dhm(r.missing)) : '✓'}</span>
       </button>${detail}`;
   }).join('') : '<p class="empty">Nobody in the list logged time in this week.</p>';
 
@@ -558,7 +572,7 @@ function renderTeam(t) {
 
   $('team').innerHTML = `<div id="mp"></div>${tiles}${notice}
     <div class="team-grid">${head}${rows}</div>
-    <div class="cal-legend"><span><i style="background: var(--green-soft)"></i>${esc(t.target)}h reached</span><span><i style="background: var(--amber-soft)"></i>Partly logged</span><span><i style="background: var(--red-soft)"></i>Nothing logged</span><span>Click a name for details</span></div>
+    <div class="cal-legend"><span><i style="background: var(--green-soft)"></i>Target reached</span><span><i style="background: var(--amber-soft)"></i>Partly logged</span><span><i style="background: var(--red-soft)"></i>Nothing logged</span><span><i class="off-swatch"></i>Day off</span><span>Click a name for details</span></div>
     <h2 class="section-title">Overdue tasks in the team <span class="muted" style="font-weight:400">(more than ${days} days past due)</span></h2>
     ${overdue}`;
   for (const btn of $('team').querySelectorAll('.tg-row')) {
@@ -567,7 +581,40 @@ function renderTeam(t) {
       renderTeam(view.team);
     });
   }
+  const ww = $('ww-form');
+  if (ww) {
+    ww.addEventListener('submit', (e) => { e.preventDefault(); saveWorkWeek(ww.dataset.member, [0, 1, 2, 3, 4].map((i) => $(`ww-${i}`).value)); });
+    const reset = $('ww-reset');
+    if (reset) reset.addEventListener('click', () => saveWorkWeek(ww.dataset.member, null));
+    ww.addEventListener('input', () => {
+      const sum = [0, 1, 2, 3, 4].reduce((a, i) => a + (Number($(`ww-${i}`).value) || 0), 0);
+      $('ww-total').textContent = `${hm(sum)} a week`;
+    });
+  }
   renderPicker();
+}
+
+// Working week of one person (admins): hours for Monday..Friday; 0 = day off
+function workWeekEditor(r) {
+  const names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
+  return `<form class="ww" id="ww-form" data-member="${esc(r.id)}">
+      <h4>Working week</h4>
+      <div class="ww-days">${names.map((n, i) => `<label>${n}<input id="ww-${i}" type="number" min="0" max="24" step="0.25" value="${esc(r.dayTargets[i])}" aria-label="${n}, hours"></label>`).join('')}</div>
+      <div class="ww-foot">
+        <span class="muted" id="ww-total">${esc(hm(r.weekHours))} a week</span>
+        ${r.customWeek ? `<button type="button" class="link-btn" id="ww-reset">Back to ${esc(hm(current.settings.targetHours))} every day</button>` : ''}
+        <button type="submit" class="btn btn-small btn-primary">Save</button>
+      </div>
+      <p class="wd-note" id="ww-error" role="alert"></p>
+    </form>`;
+}
+
+async function saveWorkWeek(memberId, hours) {
+  const res = await jwh.setWorkWeek(memberId, hours);
+  if (!res.ok) { $('ww-error').textContent = res.message; return; }
+  current.settings.workWeeks = res.data;
+  view.team = null;
+  await loadView();
 }
 
 // --------------------------------------------------------- member picker
@@ -692,7 +739,7 @@ async function applyPicker() {
 
 function renderMonthSide(m) {
   $('weekcard').innerHTML = `
-    <div class="stat-row"><div class="card-title">Month</div><div class="val"><strong>${h2(m.monthTotal)}</strong></div></div>
+    <div class="stat-row"><div class="card-title">Month</div><div class="val"><strong>${dhm(m.monthTotal)}</strong></div></div>
     <div class="note" style="margin-top:8px">${monthNote(m)}</div>`;
 }
 
@@ -712,12 +759,12 @@ function renderToday(r, s) {
   let value;
   let sub;
   let valueClass = '';
-  if (t.isWeekend) { value = h1(t.logged); sub = 'logged (weekend)'; valueClass = 'weekend'; }
-  else if (done) { value = 'Done'; sub = `${h1(t.logged)} logged`; valueClass = 'done'; }
-  else { value = h1(t.missing); sub = 'remaining'; }
+  if (t.isWeekend) { value = hm(t.logged); sub = 'logged (weekend)'; valueClass = 'weekend'; }
+  else if (done) { value = 'Done'; sub = `${hm(t.logged)} logged`; valueClass = 'done'; }
+  else { value = hm(t.missing); sub = 'remaining'; }
 
   let since = '';
-  if (s.sinceLast) since = `${s.sinceLast > 0 ? '+' : '−'}${h1(Math.abs(s.sinceLast))} since last update`;
+  if (s.sinceLast) since = `${s.sinceLast > 0 ? '+' : '−'}${hm(Math.abs(s.sinceLast))} since last update`;
 
   $('today').innerHTML = `
     <div class="card-title">Today · ${esc(t.label)}</div>
@@ -729,7 +776,7 @@ function renderToday(r, s) {
       </svg>
       <div class="ring-label"><div class="ring-value ${valueClass}">${esc(value)}</div><div class="ring-sub">${esc(sub)}</div></div>
     </div>
-    <div><strong>${h1(t.logged)}</strong> of ${esc(r.target)}h logged</div>
+    <div><strong>${hm(t.logged)}</strong> of ${esc(r.target)}h logged</div>
     <div class="since ${s.sinceLast < 0 ? 'down' : ''}">${esc(since)}</div>
     <button class="btn btn-primary btn-block" id="update-btn" type="button" ${s.updating ? 'disabled' : ''}>${s.updating ? 'Updating…' : 'Update now'}</button>`;
   $('update-btn').addEventListener('click', () => jwh.refresh());
@@ -738,10 +785,10 @@ function renderToday(r, s) {
 function renderSide(r, s) {
   const groupTitle = s.settings.categoryField === 'sprint' ? 'By sprint' : 'By category';
   const missingText = r.missingDays.length
-    ? `Missing: ${r.missingDays.map((d) => `${d.label.slice(0, 3)} ${h2(d.missing)}`).join(', ')}`
+    ? `Missing: ${r.missingDays.map((d) => `${d.label.slice(0, 3)} ${hm(d.missing)}`).join(', ')}`
     : (r.isCurrentWeek ? 'Nothing missing so far this week' : 'Nothing missing in this week');
   $('weekcard').innerHTML = `
-    <div class="stat-row"><div class="card-title">${r.isCurrentWeek ? 'Week' : `Week ${r.weekNumber}`}</div><div class="val"><strong>${h2(r.weekTotal)}</strong> / ${esc(r.weekTarget)}h</div></div>
+    <div class="stat-row"><div class="card-title">${r.isCurrentWeek ? 'Week' : `Week ${r.weekNumber}`}</div><div class="val"><strong>${dhm(r.weekTotal)}</strong> / ${dhm(r.weekTarget)}</div></div>
     <div class="thin-bar"><div style="width:${pct(r.weekTotal, r.weekTarget)}"></div></div>
     <div class="note">${esc(missingText)}</div>`;
 
@@ -751,7 +798,7 @@ function renderSide(r, s) {
     ${r.categories.length ? `<div class="cats">${r.categories.map((c) => `
       <div class="name" title="${esc(c.name)}">${esc(c.name)}</div>
       <div class="mini"><div style="width:${pct(c.hours, max)}"></div></div>
-      <div class="hrs">${h2(c.hours)}</div>`).join('')}</div>` : '<div class="note" style="margin-top:8px">No hours logged in this week</div>'}`;
+      <div class="hrs">${dhm(c.hours)}</div>`).join('')}</div>` : '<div class="note" style="margin-top:8px">No hours logged in this week</div>'}`;
 }
 
 // ------------------------------------------------------------- tray icon
@@ -818,7 +865,7 @@ function openSettings() {
   $('f-lday-end').value = s.lunchEnd || '13:00';
   $('lday-error').hidden = true;
   renderLunchChanges();
-  $('app-version').textContent = current.version ? `Jira Week Hours ${current.version}` : '';
+  $('app-version').textContent = `Jira Week Hours${current.version ? ` ${current.version}` : ''} \u00b7 by Michael Ladurner \u00b7 Apache License 2.0`;
   const known = ['sprint', 'issuetype', 'project', 'components', 'labels'];
   $('f-category').value = known.includes(s.categoryField) ? s.categoryField : '__custom';
   $('f-custom').value = known.includes(s.categoryField) ? '' : s.categoryField;

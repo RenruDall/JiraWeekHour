@@ -229,7 +229,7 @@ async function refresh(reason) {
     state.report = report;
     state.error = null;
     if (reason.startsWith('scheduled') && report.today.missing > 0) {
-      notify('Jira hours', `${report.today.missing.toFixed(1)}h remaining today (${report.today.logged.toFixed(1)}h logged so far).`, 'info');
+      notify('Jira hours', `${core.formatDuration(report.today.missing)} remaining today (${core.formatDuration(report.today.logged)} logged so far).`, 'info');
     }
   } catch (err) {
     state.error = { kind: err.kind || 'other', message: err.message || String(err) };
@@ -345,6 +345,20 @@ async function teamCandidates() {
     group = state.members.list || [];
   }
   return { selected: settings.teamMembers, group };
+}
+
+// Working week of one team member (admins only); null = back to the daily target every day
+async function setWorkWeek(memberId, hours) {
+  const settings = loadSettings();
+  if (!settings.demo) await adminContext(settings);
+  const id = String(memberId || '').slice(0, 200);
+  if (!id) throw new Error('No person selected.');
+  const workWeeks = { ...settings.workWeeks };
+  if (hours === null) delete workWeeks[id];
+  else workWeeks[id] = core.checkWorkWeek(hours);
+  const next = core.normalizeSettings({ ...settings, workWeeks, ...state.policy });
+  writeSettings(next);
+  return next.workWeeks;
 }
 
 async function setTeamMembers(list) {
@@ -615,6 +629,7 @@ function registerIpc() {
   ipcMain.handle('search-users', (_e, query) => safely(searchUsers)(String(query || '').slice(0, 100)));
   ipcMain.handle('team-candidates', () => safely(teamCandidates)());
   ipcMain.handle('set-team-members', (_e, list) => safely(setTeamMembers)(list));
+  ipcMain.handle('set-work-week', (_e, memberId, hours) => safely(setWorkWeek)(memberId, Array.isArray(hours) ? hours : null));
   ipcMain.on('open-jira', (_e, key) => {
     const settings = loadSettings();
     if (!settings.baseUrl || settings.demo) return;

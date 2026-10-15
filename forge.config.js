@@ -13,9 +13,10 @@ module.exports = {
     asar: true,
     ignore: [/^\/(test|docs|out|\.github)(\/|$)/, /^\/README\.md$/],
     win32metadata: {
-      CompanyName: 'Jira Week Hours',
+      CompanyName: 'Michael Ladurner',
       FileDescription: 'Jira Week Hours',
       ProductName: 'Jira Week Hours',
+      LegalCopyright: 'Copyright 2026 Michael Ladurner. Apache License 2.0.',
     },
   },
   hooks: {
@@ -35,6 +36,7 @@ module.exports = {
       config: {
         name: 'JiraWeekHours',
         setupExe: 'JiraWeekHours-Setup.exe',
+        authors: 'Michael Ladurner',
         setupIcon: path.join(__dirname, 'src', 'ui', 'icon.ico'),
       },
     },
